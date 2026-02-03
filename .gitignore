@@ -1,0 +1,17 @@
+# Env and secrets - never commit API keys
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Dependencies (if you add package.json later)
+node_modules/
+
+# Logs and temp
+*.log
+.DS_Store
+.cache/
+
+# Optional: JSON dumps used for MCP/offline sync (may contain internal data)
+# issues-export.json
+# combined.json
