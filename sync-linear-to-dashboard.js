@@ -1021,7 +1021,10 @@ async function main() {
   }
 
   const summaryEnd = html.indexOf('        // Team detailed data');
-  const summaryStart = html.indexOf('        const summaryStats = {');
+  // Start from the first "Summary stats" comment so we replace the full block (including lastLinearSyncAt and any duplicate lines)
+  let summaryStart = html.indexOf('        // Summary stats (UPDATED FROM LINEAR');
+  if (summaryStart === -1) summaryStart = html.indexOf('        const lastLinearSyncAt = ');
+  if (summaryStart === -1) summaryStart = html.indexOf('        const summaryStats = {');
   if (summaryStart === -1 || summaryEnd === -1) {
     console.error('Could not find summaryStats block in HTML.');
     process.exit(1);
