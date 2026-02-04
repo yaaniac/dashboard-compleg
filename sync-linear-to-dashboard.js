@@ -19,6 +19,22 @@ const OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress', 'In Review', 'On Hold']
 // PGA performance: custom status mapping. Done = On Going, Ended, Pending Signature; open = Backlog, Todo, In Progress.
 const PGA_OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress'];
 const PGA_CLOSED_STATUSES = ['On Going', 'Ongoing', 'Ended', 'Pending Signature'];
+// PGA contract types from Linear "Type of Request" labels (match label name, case-insensitive)
+const PGA_CONTRACT_TYPES = [
+  { type: 'Core', description: 'Core service providers' },
+  { type: 'Growth', description: 'Influencer/partnership agreements' },
+  { type: 'NDA', description: 'Non-disclosure agreements' },
+  { type: 'No HR', description: 'Consultants, addendums, freelancers' },
+  { type: 'Sponsorships', description: 'Sponsorship deals (Roxom TV)' },
+];
+function getPgaContractType(labels) {
+  const arr = Array.isArray(labels) ? labels : [];
+  const lower = (s) => (s || '').toLowerCase().trim();
+  for (const { type } of PGA_CONTRACT_TYPES) {
+    if (arr.some(l => lower(l) === lower(type))) return type;
+  }
+  return 'None';
+}
 
 function isPgaOpen(row) {
   const s = (row.state || '').trim();
@@ -523,6 +539,19 @@ function buildDashboardData(issues) {
       return 0;
     });
 
+  // PGA "open" = Backlog + Todo + In Progress (for sidebar when By Team → PGA, click OPEN)
+  const pgaOpenIssues = rowsActive
+    .filter(r => r.team === 'PGA' && isPgaOpen(r))
+    .map(r => ({
+      id: r.id,
+      title: r.title,
+      team: r.team,
+      assignee: r.assignee,
+      priority: r.priority,
+      url: r.url,
+      state: r.state,
+    }));
+
   // List of all closed issues for the sidebar
   const closedIssues = closed
     .filter(r => ALL_TEAMS.includes(r.team))
@@ -682,6 +711,7 @@ function buildDashboardData(issues) {
     noDueDateIssues,
     closedIssues,
     pgaClosedIssues,
+    pgaOpenIssues,
     canceledCount: canceledForAll.length,
     duplicatedCount: duplicatedForAll.length,
     canceledByTeam,
@@ -725,6 +755,64 @@ function buildDashboardData(issues) {
       issuesByShirtSize: issuesByShirtSizeForTeam,
     };
   });
+
+  // PGA: byStatus = Backlog, Todo, In Progress only (match Linear labels); byPriority from open issues
+  // Reuse velocity & avgCycleTime from byTeam['PGA'] (avgCycleTime = avg days creation→close; velocity = closed/10 weeks)
+  if (allTeamKeys.includes('PGA')) {
+    const pgaTeamOpen = rowsActive.filter(r => r.team === 'PGA' && isPgaOpen(r));
+    const pgaTeamClosed = rowsActive.filter(r => r.team === 'PGA' && isPgaClosed(r));
+    const pgaOverdueForTeam = pgaTeamOpen.filter(r => r.dueDate && r.dueDate < today);
+    const pgaStatusCounts = {};
+    pgaTeamOpen.forEach(r => { pgaStatusCounts[r.state] = (pgaStatusCounts[r.state] || 0) + 1; });
+    const pgaPriorityCounts = {};
+    pgaTeamOpen.forEach(r => { pgaPriorityCounts[r.priority] = (pgaPriorityCounts[r.priority] || 0) + 1; });
+    const pgaByStatus = sortByStatusOrder(Object.entries(pgaStatusCounts).map(([status, count]) => ({ status, count })));
+    const pgaByPriority = PRIORITY_ORDER.map(p => ({ priority: p, count: (pgaPriorityCounts[p] || 0) }));
+    const pgaByShirtSize = pgaTeamOpen.length > 0 ? [{ size: 'N/A', count: pgaTeamOpen.length }] : [];
+    const pgaIssuesByShirtSize = { 'N/A': pgaTeamOpen.map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url, state: r.state })) };
+    const pgaByTeam = byTeam['PGA'];
+    // By Contract Type: from labels (Type of Request = Core, Growth, NDA, No HR, Sponsorships, None)
+    const pgaAll = [...pgaTeamOpen, ...pgaTeamClosed];
+    const pgaContractTypeCounts = {};
+    pgaAll.forEach(r => {
+      const t = getPgaContractType(r.labels || []);
+      pgaContractTypeCounts[t] = (pgaContractTypeCounts[t] || 0) + 1;
+    });
+    const pgaByContractType = [
+      ...PGA_CONTRACT_TYPES.filter(ct => (pgaContractTypeCounts[ct.type] || 0) > 0).map(ct => ({ type: ct.type, count: pgaContractTypeCounts[ct.type] || 0, description: ct.description })),
+      ...(pgaContractTypeCounts['None'] ? [{ type: 'None', count: pgaContractTypeCounts['None'], description: 'Unclassified' }] : []),
+    ];
+    // By Assignee: open, closed, total per assignee for PGA
+    const pgaAssigneeCounts = {};
+    pgaAll.forEach(r => {
+      const a = r.assignee || 'Unassigned';
+      if (!pgaAssigneeCounts[a]) pgaAssigneeCounts[a] = { open: 0, closed: 0 };
+      if (isPgaOpen(r)) pgaAssigneeCounts[a].open += 1;
+      else if (isPgaClosed(r)) pgaAssigneeCounts[a].closed += 1;
+    });
+    const pgaByAssignee = Object.entries(pgaAssigneeCounts)
+      .filter(([, c]) => c.open > 0 || c.closed > 0)
+      .map(([assignee, c]) => ({ assignee, open: c.open, closed: c.closed, total: c.open + c.closed }))
+      .sort((a, b) => (b.open + b.closed) - (a.open + a.closed));
+    teamDetailedData['PGA'] = {
+      total: pgaTeamOpen.length + pgaTeamClosed.length,
+      open: pgaTeamOpen.length,
+      closed: pgaTeamClosed.length,
+      overdue: pgaOverdueForTeam.length,
+      byStatus: pgaByStatus,
+      byPriority: pgaByPriority,
+      byShirtSize: pgaByShirtSize,
+      overdueIssues: overdueIssues.filter(i => i.team === 'PGA'),
+      issuesByShirtSize: pgaIssuesByShirtSize,
+      velocity: pgaByTeam.velocity,
+      avgCycleTime: pgaByTeam.avgCycleTime,
+      closedWithDueDate: pgaByTeam.closedWithDueDate,
+      closedOnTime: pgaByTeam.closedOnTime,
+      sla: pgaByTeam.sla,
+      byContractType: pgaByContractType,
+      byAssignee: pgaByAssignee,
+    };
+  }
 
   const assigneeDetailedData = {};
   assignees.forEach(a => {
@@ -1146,6 +1234,7 @@ function formatSummaryStatsBlock(data) {
   });
   out += `            ],\n`;
   out += `            pgaClosedIssues: ${JSON.stringify(s.pgaClosedIssues || [])},\n`;
+  out += `            pgaOpenIssues: ${JSON.stringify(s.pgaOpenIssues || [])},\n`;
   out += `            canceledCount: ${s.canceledCount},\n`;
   out += `            duplicatedCount: ${s.duplicatedCount},\n`;
   out += `            canceledByTeam: ${JSON.stringify(s.canceledByTeam)},\n`;
@@ -1167,8 +1256,15 @@ function formatTeamDetailedBlock(data) {
     out += `                byPriority: ${JSON.stringify(v.byPriority)},\n`;
     out += `                byShirtSize: ${JSON.stringify(v.byShirtSize)},\n`;
     out += `                overdueIssues: summaryStats.overdueIssues.filter(i => i.team === '${key}'),\n`;
-    out += `                issuesByShirtSize: ${JSON.stringify(v.issuesByShirtSize || {})}\n`;
-    out += `            },\n`;
+    out += `                issuesByShirtSize: ${JSON.stringify(v.issuesByShirtSize || {})}`;
+    if (key === 'PGA') {
+      if (v.velocity != null || v.avgCycleTime != null) {
+        out += `,\n                velocity: ${v.velocity}, avgCycleTime: ${v.avgCycleTime != null ? v.avgCycleTime : 'null'}, closedWithDueDate: ${v.closedWithDueDate != null ? v.closedWithDueDate : 'null'}, closedOnTime: ${v.closedOnTime != null ? v.closedOnTime : 'null'}, sla: ${v.sla != null ? v.sla : 'null'}`;
+      }
+      if (v.byContractType && v.byContractType.length) out += `,\n                byContractType: ${JSON.stringify(v.byContractType)}`;
+      if (v.byAssignee && v.byAssignee.length) out += `,\n                byAssignee: ${JSON.stringify(v.byAssignee)}`;
+    }
+    out += `\n            },\n`;
   });
   out += `        };\n\n`;
   return out;
@@ -1454,12 +1550,20 @@ async function main() {
   html = html.slice(0, summaryStart) + summaryBlock + html.slice(summaryEnd);
 
   const teamStart = html.indexOf('        // Team detailed data');
-  const pgaCommentStart = html.indexOf('            // PGA: Team satélite', teamStart);
-  const teamBlockEnd = html.indexOf('        };\n\n        // PGA data filtered', teamStart);
-  const pgaBlock = html.slice(pgaCommentStart, teamBlockEnd + '        };'.length);
-  const mainTeamsBlock = formatTeamDetailedBlock(data).replace(/\n\s*\};\s*\n\s*$/, '');
-  const newTeamBlockFull = mainTeamsBlock + '\n            ' + pgaBlock.slice(pgaBlock.indexOf('// PGA:'));
-  html = html.slice(0, teamStart) + newTeamBlockFull + '\n\n        // PGA data filtered' + html.slice(teamBlockEnd + '        };'.length + '\n\n        // PGA data filtered'.length);
+  const pgaCommentStart = html.indexOf('        // PGA data filtered', teamStart);
+  if (teamStart === -1 || pgaCommentStart === -1) {
+    console.error('Could not find teamDetailedData block in HTML.');
+    process.exit(1);
+  }
+  const between = html.slice(teamStart, pgaCommentStart);
+  const lastClosing = between.lastIndexOf('        };');
+  if (lastClosing === -1) {
+    console.error('Could not find teamDetailedData block closing in HTML.');
+    process.exit(1);
+  }
+  const teamBlockEnd = teamStart + lastClosing + '        };'.length;
+  const newTeamBlockFull = formatTeamDetailedBlock(data);
+  html = html.slice(0, teamStart) + newTeamBlockFull + html.slice(teamBlockEnd);
 
   const assigneeStart = html.indexOf('        // Assignee detailed data');
   const assigneeEnd = html.indexOf('        };\n\n        // Performance data', assigneeStart);
