@@ -16,8 +16,35 @@ const PRIORITY_MAP = { 0: 'None', 1: 'Urgent', 2: 'High', 3: 'Medium', 4: 'Low' 
 const SHIRT_LABELS = ['XS', 'S', 'M', 'L', 'XL'];
 // Open = only these statuses (sum of Backlog + Todo + In Progress + In Review + On Hold) - excludes Pending Signature (PGA label)
 const OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress', 'In Review', 'On Hold'];
+// PGA performance: custom status mapping (done = on going, ended; open = backlog, todo, in progress, pending signature)
+const PGA_OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress', 'Pending Signature'];
+const PGA_CLOSED_STATUSES = ['On Going', 'Ongoing', 'Ended'];
+
+function isPgaOpen(row) {
+  const s = (row.state || '').trim();
+  return PGA_OPEN_STATUSES.some(open => open.toLowerCase() === s.toLowerCase());
+}
+function isPgaClosed(row) {
+  const s = (row.state || '').trim();
+  return PGA_CLOSED_STATUSES.some(closed => closed.toLowerCase() === s.toLowerCase());
+}
+// Estados que no deben contarse en ninguna card (open, closed, by person, etc.). Incluye trashed/para restaurar.
+const ELIMINATED_STATES = ['Canceled', 'Duplicate', 'Deleted', 'Archived', 'Trashed'];
+function isEliminatedState(state) {
+  if (!state || typeof state !== 'string') return false;
+  const s = state.toLowerCase();
+  if (ELIMINATED_STATES.some(e => e.toLowerCase() === s)) return true;
+  if (s.includes('delete') || s.includes('trash') || s.includes('restore')) return true;
+  return false;
+}
 const MAIN_TEAMS = ['Comp-leg', 'FCP', 'LTO', 'RPA']; // All = sum of these 4 (excludes PGA)
 const PRIORITY_ORDER = ['Urgent', 'High', 'Medium', 'Low', 'None']; // fixed order so By Priority chart always shows labels in All tab
+// Display name for assignees (Linear name → dashboard label)
+const ASSIGNEE_DISPLAY_NAMES = { sofita: 'Sofia' };
+function assigneeDisplayName(name) {
+  if (!name) return 'Unassigned';
+  return ASSIGNEE_DISPLAY_NAMES[name] || ASSIGNEE_DISPLAY_NAMES[name.toLowerCase()] || name;
+}
 
 function linearRequest(query, variables = {}) {
   return fetch(LINEAR_API, {
@@ -45,11 +72,26 @@ async function fetchAllIssues() {
           createdAt
           updatedAt
           completedAt
+          trashed
           priority
           state { name type }
           team { key name id }
           assignee { name }
           labels { nodes { name } }
+          project { id name slugId }
+          parent { id }
+          children {
+            nodes {
+              id
+              identifier
+              title
+              url
+              state { name }
+              assignee { name }
+              priority
+              project { name }
+            }
+          }
         }
         pageInfo { hasNextPage endCursor }
       }
@@ -74,6 +116,33 @@ const TEAM_NAME_MAP = {
   'PGA': 'PGA',
 };
 
+// Assignee → team for dashboard: issues assigned to these people count for that team (e.g. yani/yanina → FCP).
+const ASSIGNEE_TO_TEAM = {
+  'yanina acosta': 'FCP', 'yani': 'FCP', 'yanina': 'FCP',
+  'guadalupe assorati': 'LTO', 'guadalupe': 'LTO',
+  'pasto': 'LTO',
+  'sofita': 'RPA', 'sofia': 'RPA',
+  'alfonso martel seward': 'RPA', 'alfonso martel': 'RPA',
+};
+function getDashboardTeam(row) {
+  const assigneeNorm = (row.assignee || '').toLowerCase().trim();
+  if (ASSIGNEE_TO_TEAM[assigneeNorm]) return ASSIGNEE_TO_TEAM[assigneeNorm];
+  const team = row.team;
+  return MAIN_TEAMS.includes(team) || team === 'PGA' ? team : (TEAM_NAME_MAP[team] || team);
+}
+
+/** For DKR parent issues: team from parent assignee, or from first child with ASSIGNEE_TO_TEAM (so yani's sub-issues count for FCP). */
+function getDkrDashboardTeam(dkrRow) {
+  const fromParent = getDashboardTeam(dkrRow);
+  if (MAIN_TEAMS.includes(fromParent)) return fromParent;
+  const children = dkrRow.children || [];
+  for (const c of children) {
+    const assigneeNorm = (c.assignee || '').toLowerCase().trim();
+    if (ASSIGNEE_TO_TEAM[assigneeNorm]) return ASSIGNEE_TO_TEAM[assigneeNorm];
+  }
+  return fromParent;
+}
+
 function normalizeTeam(teamName, teamKey) {
   if (TEAM_NAME_MAP[teamName]) return TEAM_NAME_MAP[teamName];
   if (teamKey && ['Comp-leg', 'FCP', 'LTO', 'RPA', 'PGA'].includes(teamKey)) return teamKey;
@@ -84,7 +153,7 @@ function toIssueRow(i) {
   const teamName = i.team?.name || '';
   const teamKey = i.team?.key || '';
   const team = normalizeTeam(teamName, teamKey);
-  const assignee = i.assignee?.name || 'Unassigned';
+  const assignee = assigneeDisplayName(i.assignee?.name);
   const priority = PRIORITY_MAP[i.priority] ?? 'None';
   const labels = (i.labels?.nodes || []).map(l => l.name);
   
@@ -112,24 +181,52 @@ function toIssueRow(i) {
     else shirtSize = 'XL';
   }
   
+  const project = i.project ? { id: i.project.id, name: i.project.name, slugId: i.project.slugId } : null;
+  const projectUrl = project?.slugId ? `https://linear.app/roxom/project/${project.slugId}` : null;
+  const childNodes = i.children?.nodes || [];
+  const children = childNodes.map(c => ({
+    id: c.identifier,
+    title: c.title,
+    team,
+    assignee: assigneeDisplayName(c.assignee?.name),
+    priority: PRIORITY_MAP[c.priority] ?? 'None',
+    url: c.url || `https://linear.app/roxom/issue/${c.identifier}`,
+    state: c.state?.name || 'Unknown',
+    projectName: c.project?.name || null,
+  }));
+  const dashboardTeam = getDashboardTeam({ team, assignee });
+  const group = getGroup(labels); // "Group: Roxom Global" → Global, "Group: Roxom TV" → Roxom TV, "Group: Roxom" → Roxom
   return {
     id: i.identifier,
     title: i.title,
     team,
     assignee,
+    dashboardTeam,
+    group,
     priority,
     url: i.url || `https://linear.app/roxom/issue/${i.identifier}`,
     state: i.state?.name || 'Unknown',
     dueDate: i.dueDate,
     createdAt: i.createdAt,
     completedAt: i.completedAt,
+    trashed: !!i.trashed,
     shirtSize,
     labels,
+    project: project?.name || null,
+    projectUrl: projectUrl || null,
+    parentId: i.parent?.id || null,
+    children,
   };
 }
 
 function getGroup(labels) {
   const arr = Array.isArray(labels) ? labels : [];
+  // "Group: Roxom Global" = holding/global → Global (debe ir primero para no confundir con "Group: Roxom")
+  const hasRoxomGlobal = arr.some(l => {
+    const s = (l && (typeof l === 'string' ? l : String(l))).toString().toLowerCase().trim();
+    return s === 'group: roxom global' || s.includes('roxom global');
+  });
+  if (hasRoxomGlobal) return 'Global';
   const hasRoxomTV = arr.some(l => {
     const s = (l && (typeof l === 'string' ? l : String(l))).toString().toLowerCase().trim();
     return s.includes('roxom tv') || s === 'group: roxom tv';
@@ -137,7 +234,7 @@ function getGroup(labels) {
   if (hasRoxomTV) return 'Roxom TV';
   const hasRoxom = arr.some(l => {
     const s = (l && (typeof l === 'string' ? l : String(l))).toString().toLowerCase().trim();
-    return (s.includes('group') && s.includes('roxom') && !s.includes('roxom tv')) || s === 'roxom' || s === 'roxom global';
+    return (s.includes('group') && s.includes('roxom') && !s.includes('roxom tv') && !s.includes('roxom global')) || s === 'roxom';
   });
   if (hasRoxom) return 'Roxom';
   return null;
@@ -196,16 +293,29 @@ function getLast11WeekKeys() {
 
 function buildDashboardData(issues) {
   const rows = issues.map(toIssueRow);
+  // NINGUNA métrica debe incluir issues eliminadas: trashed, estado Deleted/Canceled/Duplicate/Archived/Trashed, ni sin asignar.
+  // rowsActive = única base para open/closed/byTeam/byAssignee/velocity/SLA/cycleTime/weeklyData/qualityData/OKR.
+  // canceled/duplicated excluyen trashed. deletedIssueIds = IDs excluidas para el sidebar del dashboard.
+  const rowsActive = rows.filter(r => {
+    if (r.trashed) return false;
+    if (isEliminatedState(r.state)) return false;
+    if (r.assignee === 'Unassigned') return false;
+    return true;
+  });
+  // IDs excluidas (trashed/eliminated/unassigned) para que el dashboard las filtre al hacer click en barras
+  const deletedIssueIds = rows
+    .filter(r => r.trashed || isEliminatedState(r.state) || r.assignee === 'Unassigned')
+    .map(r => r.id);
   const today = new Date().toISOString().slice(0, 10);
   const in7Days = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-  // Open = only Backlog + Todo + In Progress + In Review + On Hold (excludes Pending Signature - PGA label)
-  const open = rows.filter(r => r.state && OPEN_STATUSES.includes(r.state));
-  // Closed = only Done (exclude Canceled, Ongoing, Ended)
-  const closed = rows.filter(r => r.state === 'Done');
-  // Canceled and Duplicated issues (for tracking total)
-  const canceled = rows.filter(r => r.state === 'Canceled');
-  const duplicated = rows.filter(r => r.state === 'Duplicate');
+  // Open = only Backlog + Todo + In Progress + In Review + On Hold (excludes Pending Signature - PGA label). Sin eliminated.
+  const open = rowsActive.filter(r => r.state && OPEN_STATUSES.includes(r.state));
+  // Closed = only Done (exclude Canceled, Ongoing, Ended). Sin eliminated.
+  const closed = rowsActive.filter(r => r.state === 'Done');
+  // Canceled and Duplicated: solo para las cards de reconciliación; excluir trashed para que no entren en ninguna métrica
+  const canceled = rows.filter(r => r.state === 'Canceled' && !r.trashed);
+  const duplicated = rows.filter(r => r.state === 'Duplicate' && !r.trashed);
   const overdue = open.filter(r => r.dueDate && r.dueDate < today);
   const dueSoon = open.filter(r => r.dueDate && r.dueDate >= today && r.dueDate <= in7Days);
   // For "All" view: include ALL teams (Comp-leg, FCP, LTO, RPA, PGA) - total should match Linear
@@ -220,14 +330,14 @@ function buildDashboardData(issues) {
   openForAll.forEach(r => {
     const s = r.state || 'Backlog';
     if (!byStatus[s]) byStatus[s] = [];
-    byStatus[s].push({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url });
+    byStatus[s].push({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url, state: r.state });
   });
 
   const byPriority = {};
   openForAll.forEach(r => {
     const p = r.priority || 'None';
     if (!byPriority[p]) byPriority[p] = [];
-    byPriority[p].push({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url });
+    byPriority[p].push({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url, state: r.state });
   });
 
   const byTeam = {};
@@ -237,14 +347,17 @@ function buildDashboardData(issues) {
     const teamClosedIn10Weeks = teamClosed.filter(r => inLastNWeeks(r.completedAt, 10));
     const teamOverdue = overdue.filter(r => r.team === t);
 
-    let teamSla = null;
-    if (teamClosed.length > 0) {
-      const teamWithDates = teamClosed.filter(r => r.createdAt && r.completedAt);
-      if (teamWithDates.length > 0) {
-        const totalResolutionTime = teamWithDates.reduce((sum, r) => sum + daysBetween(r.createdAt, r.completedAt), 0);
-        teamSla = Number((totalResolutionTime / teamWithDates.length).toFixed(2));
-      }
+    // Avg cycle time (días): promedio creación → cierre para cerrados con fechas
+    let avgCycleTime = null;
+    const teamWithDates = teamClosed.filter(r => r.createdAt && r.completedAt);
+    if (teamWithDates.length > 0) {
+      const totalResolutionTime = teamWithDates.reduce((sum, r) => sum + daysBetween(r.createdAt, r.completedAt), 0);
+      avgCycleTime = Number((totalResolutionTime / teamWithDates.length).toFixed(2));
     }
+    // SLA (%): % de cerrados con due date que se cerraron a tiempo
+    const teamClosedWithDue = teamClosed.filter(r => r.dueDate && r.completedAt);
+    const teamClosedOnTime = teamClosedWithDue.filter(r => r.completedAt.slice(0, 10) <= r.dueDate.slice(0, 10));
+    const slaPct = teamClosedWithDue.length > 0 ? Math.round((teamClosedOnTime.length / teamClosedWithDue.length) * 100) : null;
 
     byTeam[t] = {
       team: t,
@@ -252,35 +365,39 @@ function buildDashboardData(issues) {
       closed: teamClosed.length,
       overdue: teamOverdue.length,
       velocity: (teamClosedIn10Weeks.length / 10).toFixed(1),
-      closedWithDueDate: 0,
-      closedOnTime: 0,
-      sla: teamSla,
+      closedWithDueDate: teamClosedWithDue.length,
+      closedOnTime: teamClosedOnTime.length,
+      sla: slaPct,
+      avgCycleTime,
     };
   });
   const teams = [...MAIN_TEAMS];
   // Add PGA if present in data (for teamDetailedData only; not in summaryStats.byTeam)
-  const allTeamKeys = [...new Set(rows.map(r => r.team))].filter(t => t && t !== 'Unknown');
+  const allTeamKeys = [...new Set(rowsActive.map(r => r.team))].filter(t => t && t !== 'Unknown');
   if (allTeamKeys.includes('PGA')) {
-    const teamOpen = open.filter(r => r.team === 'PGA');
-    const teamClosed = closed.filter(r => r.team === 'PGA');
+    // PGA performance: done = On Going, Ended; open = Backlog, Todo, In Progress, Pending Signature (sin eliminated)
+    const teamOpen = rowsActive.filter(r => r.team === 'PGA' && isPgaOpen(r));
+    const teamClosed = rowsActive.filter(r => r.team === 'PGA' && isPgaClosed(r));
     const teamClosedIn10Weeks = teamClosed.filter(r => inLastNWeeks(r.completedAt, 10));
+    const pgaOverdue = teamOpen.filter(r => r.dueDate && r.dueDate < today);
 
-    let pgaSla = null;
-    if (teamClosed.length > 0) {
-      const teamWithDates = teamClosed.filter(r => r.createdAt && r.completedAt);
-      if (teamWithDates.length > 0) {
-        const totalResolutionTime = teamWithDates.reduce((sum, r) => sum + daysBetween(r.createdAt, r.completedAt), 0);
-        pgaSla = Number((totalResolutionTime / teamWithDates.length).toFixed(2));
-      }
+    let pgaAvgCycleTime = null;
+    const pgaWithDates = teamClosed.filter(r => r.createdAt && r.completedAt);
+    if (pgaWithDates.length > 0) {
+      const totalResolutionTime = pgaWithDates.reduce((sum, r) => sum + daysBetween(r.createdAt, r.completedAt), 0);
+      pgaAvgCycleTime = Number((totalResolutionTime / pgaWithDates.length).toFixed(2));
     }
+    const pgaClosedWithDue = teamClosed.filter(r => r.dueDate && r.completedAt);
+    const pgaClosedOnTime = pgaClosedWithDue.filter(r => r.completedAt.slice(0, 10) <= r.dueDate.slice(0, 10));
+    const pgaSlaPct = pgaClosedWithDue.length > 0 ? Math.round((pgaClosedOnTime.length / pgaClosedWithDue.length) * 100) : null;
 
-    byTeam['PGA'] = { team: 'PGA', open: teamOpen.length, closed: teamClosed.length, overdue: overdue.filter(r => r.team === 'PGA').length, velocity: (teamClosedIn10Weeks.length / 10).toFixed(1), closedWithDueDate: 0, closedOnTime: 0, sla: pgaSla };
+    byTeam['PGA'] = { team: 'PGA', open: teamOpen.length, closed: teamClosed.length, overdue: pgaOverdue.length, velocity: (teamClosedIn10Weeks.length / 10).toFixed(1), closedWithDueDate: pgaClosedWithDue.length, closedOnTime: pgaClosedOnTime.length, sla: pgaSlaPct, avgCycleTime: pgaAvgCycleTime };
   }
 
   const byAssignee = {};
   // For byAssignee, exclude PGA (only count MAIN_TEAMS) to match other metrics
   const openForAssignee = open.filter(r => MAIN_TEAMS.includes(r.team));
-  const assignees = [...new Set(openForAssignee.map(r => r.assignee))];
+  const assignees = [...new Set(openForAssignee.map(r => r.assignee))].filter(a => a && a !== 'Unassigned');
   const weightMap = { XS: 1, S: 2, M: 3, L: 5, XL: 8, Missing: 0 };
   assignees.forEach(a => {
     const personOpen = openForAssignee.filter(r => r.assignee === a);
@@ -338,7 +455,7 @@ function buildDashboardData(issues) {
   const byStatusArr = Object.entries(byStatus).map(([status, list]) => ({ status, count: list.length }));
   const totalOpen = byStatusArr.reduce((sum, item) => sum + item.count, 0); // Sum of all statuses = totalOpen
   const totalClosed = closed.filter(r => ALL_TEAMS.includes(r.team)).length;
-  const total = rows.filter(r => ALL_TEAMS.includes(r.team)).length;
+  const total = rowsActive.filter(r => ALL_TEAMS.includes(r.team)).length;
   // Fixed order so By Priority chart always shows all labels in All tab
   const byPriorityArr = PRIORITY_ORDER.map(p => ({ priority: p, count: (byPriority[p] || []).length }));
 
@@ -360,28 +477,38 @@ function buildDashboardData(issues) {
     { type: 'Unclassified', count: openForAll.filter(r => !r.labels.some(l => ((l || '').toLowerCase().includes('okr')) || (l || '').toLowerCase().includes('bau'))).length },
   ];
 
-  // Calculate SLA at general level: average resolution time = total resolution time / count of closed issues
+  // Cycle time = average days from creation to close (all closed with dates). SLA = % closed by due date.
   // Only include MAIN_TEAMS (Comp-leg, FCP, LTO, RPA) - exclude PGA
   const closedForSla = closed.filter(r => MAIN_TEAMS.includes(r.team));
   const closedWithDatesOnly = closedForSla.filter(r => r.createdAt && r.completedAt);
-  let generalSla = null;
-  let generalSlaPrev = null;
+  // Velocity = issues en Done (sin PGA) en las últimas 10 semanas / 10
+  const closedInLast10Weeks = closedForSla.filter(r => r.completedAt && inLastNWeeks(r.completedAt, 10));
+  const closedPrev4Weeks = closedWithDatesOnly.filter(r => inPrev4Weeks(r.completedAt));
   let avgCycleTime = null;
   let avgCycleTimePrev = null;
+  let slaCompliancePct = null;  // % of closed (with due date) that were closed on or before due date
+  let slaCompliancePrevPct = null;
   let velocityPrev = 0;
-  const closedInLast10Weeks = closedWithDatesOnly.filter(r => inLastNWeeks(r.completedAt, 10));
-  const closedPrev4Weeks = closedWithDatesOnly.filter(r => inPrev4Weeks(r.completedAt));
 
   if (closedWithDatesOnly.length > 0) {
     const totalResolutionTime = closedWithDatesOnly.reduce((sum, r) => sum + daysBetween(r.createdAt, r.completedAt), 0);
-    generalSla = Number((totalResolutionTime / closedWithDatesOnly.length).toFixed(2));
-    avgCycleTime = generalSla;
+    avgCycleTime = Number((totalResolutionTime / closedWithDatesOnly.length).toFixed(2));
   }
   if (closedPrev4Weeks.length > 0) {
     const totalPrev = closedPrev4Weeks.reduce((sum, r) => sum + daysBetween(r.createdAt, r.completedAt), 0);
-    generalSlaPrev = Number((totalPrev / closedPrev4Weeks.length).toFixed(2));
-    avgCycleTimePrev = generalSlaPrev;
+    avgCycleTimePrev = Number((totalPrev / closedPrev4Weeks.length).toFixed(2));
     velocityPrev = Number((closedPrev4Weeks.length / 4).toFixed(1));
+  }
+  // SLA compliance: % of closed issues that had a due date and were closed on or before due date
+  const closedWithDueDate = closedForSla.filter(r => r.dueDate && r.completedAt);
+  const closedOnTime = closedWithDueDate.filter(r => r.completedAt.slice(0, 10) <= r.dueDate.slice(0, 10));
+  if (closedWithDueDate.length > 0) {
+    slaCompliancePct = Math.round((closedOnTime.length / closedWithDueDate.length) * 100);
+  }
+  const closedPrev4WithDue = closedPrev4Weeks.filter(r => r.dueDate);
+  const closedOnTimePrev = closedPrev4WithDue.filter(r => r.completedAt.slice(0, 10) <= r.dueDate.slice(0, 10));
+  if (closedPrev4WithDue.length > 0) {
+    slaCompliancePrevPct = Math.round((closedOnTimePrev.length / closedPrev4WithDue.length) * 100);
   }
 
   // Canceled/Duplicated by team
@@ -443,8 +570,8 @@ function buildDashboardData(issues) {
     avgCycleTimePrev: avgCycleTimePrev !== null ? avgCycleTimePrev : 0,
     velocity: Number(velocityCurrent.toFixed(1)),
     velocityPrev: velocityPrev,
-    slaCompliance: generalSla !== null ? generalSla : 0,
-    slaCompliancePrev: generalSlaPrev !== null ? generalSlaPrev : 0,
+    slaCompliance: slaCompliancePct !== null ? slaCompliancePct : null,
+    slaCompliancePrev: slaCompliancePrevPct !== null ? slaCompliancePrevPct : null,
     byStatus: byStatusArr,
     byPriority: byPriorityArr,
     byShirtSize: byShirtSizeArr.length ? byShirtSizeArr : [
@@ -479,7 +606,7 @@ function buildDashboardData(issues) {
     ['XS', 'S', 'M', 'L', 'XL', 'Missing'].forEach(size => {
       issuesByShirtSizeForTeam[size] = teamOpen
         .filter(r => (r.shirtSize || 'Missing') === size)
-        .map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url }));
+        .map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url, state: r.state }));
     });
     
     // Calculate shirtCounts from the actual issuesByShirtSize arrays to ensure consistency
@@ -516,7 +643,7 @@ function buildDashboardData(issues) {
     ['XS', 'S', 'M', 'L', 'XL', 'Missing'].forEach(size => {
       issuesByShirtSizeForAssignee[size] = personOpen
         .filter(r => (r.shirtSize || 'Missing') === size)
-        .map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url }));
+        .map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url, state: r.state }));
     });
     
     // Calculate shirtCounts from the actual issuesByShirtSize arrays to ensure consistency
@@ -542,12 +669,129 @@ function buildDashboardData(issues) {
 
   const issuesByShirtSize = {};
   ['XS', 'S', 'M', 'L', 'XL', 'Missing'].forEach(size => {
-    issuesByShirtSize[size] = openForAll.filter(r => (r.shirtSize || 'Missing') === size).map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url }));
+    issuesByShirtSize[size] = openForAll.filter(r => (r.shirtSize || 'Missing') === size).map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url, state: r.state }));
   });
 
-  // Calculate performance data for each assignee based on closed issues
+  const okrRowToIssue = (r) => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url });
+
+  const getOkrNumFromProject = (projectName) => {
+    if (!projectName) return null;
+    const s = String(projectName);
+    if (/OKR\s*1\b/i.test(s)) return 1;
+    if (/OKR\s*2\b/i.test(s)) return 2;
+    if (/OKR\s*3\b/i.test(s)) return 3;
+    return null;
+  };
+
+  // DKR data first: one row per top-level DKR (parentId === null, title contains "DKR").
+  // Team = parent assignee or, if parent not in MAIN_TEAMS, first child assignee in ASSIGNEE_TO_TEAM (so DKR with yani's sub-issues shows under FCP).
+  const dkrTitleRe = /DKR\s*(\d+)/i;
+  const dkrEligible = (r) =>
+    MAIN_TEAMS.includes(getDkrDashboardTeam(r)) && r.state !== 'Canceled' && r.state !== 'Duplicate' &&
+    dkrTitleRe.test(r.title || '') && r.parentId == null;
+
+  const dkrParentIssues = rowsActive.filter(dkrEligible);
+
+  const dkrSummaryByTeam = {};
+  const issuesByOKR = {};
+  const dkrRowsByTeam = {}; // team -> [ { identifier, name, team, total, open, closed, completion, status, okrNum, projectName, projectUrl, list, parentState, parentAssignee, parentUrl, parentPriority } ]
+  MAIN_TEAMS.forEach(t => { dkrRowsByTeam[t] = []; });
+
+  MAIN_TEAMS.forEach(team => {
+    const teamDkrs = dkrParentIssues
+      .filter(r => getDkrDashboardTeam(r) === team)
+      .sort((a, b) => {
+        const na = (a.title || '').match(dkrTitleRe);
+        const nb = (b.title || '').match(dkrTitleRe);
+        const numA = na ? parseInt(na[1], 10) : 999;
+        const numB = nb ? parseInt(nb[1], 10) : 999;
+        return numA !== numB ? numA - numB : (a.title || '').localeCompare(b.title || '');
+      });
+    teamDkrs.forEach(r => {
+      const children = r.children || [];
+      const useChildren = children.length > 0;
+      const list = useChildren ? children : [r];
+      const openList = useChildren
+        ? children.filter(c => OPEN_STATUSES.includes(c.state))
+        : (OPEN_STATUSES.includes(r.state) ? [r] : []);
+      const closedList = useChildren
+        ? children.filter(c => c.state === 'Done')
+        : (r.state === 'Done' || r.completedAt ? [r] : []);
+      const total = list.length;
+      const open = openList.length;
+      const closed = closedList.length;
+      const completion = total > 0 ? Math.round((closed / total) * 100) : 0;
+      let status = 'blocked';
+      if (completion >= 100) status = 'done';
+      else if (completion >= 50) status = 'on_track';
+      else if (completion >= 25) status = 'at_risk';
+      // OKR assignment: parent's project, or first child's project if parent has none
+      const projectName = r.project || (r.children && r.children[0] && r.children[0].projectName) || null;
+      const okrNum = getOkrNumFromProject(projectName);
+      const projectUrl = r.projectUrl || null;
+      issuesByOKR[r.id] = list.map(x => ({ id: x.id, title: x.title, team, assignee: x.assignee, priority: x.priority, url: x.url }));
+      dkrSummaryByTeam[team] = dkrSummaryByTeam[team] || [];
+      dkrSummaryByTeam[team].push({ identifier: r.id, name: r.title, team, total, open, closed, completion, target: 100, status, okrNum });
+      dkrRowsByTeam[team].push({
+        identifier: r.id, name: r.title, team, total, open, closed, completion, status, okrNum, projectName, projectUrl, list,
+        parentState: r.state, parentAssignee: r.assignee, parentUrl: r.url, parentPriority: r.priority, parentDueDate: r.dueDate,
+      });
+    });
+  });
+
+  // OKR 1, 2, 3 CARDS: count only DKR parent issues (not sub-issues). Open/Done = how many DKRs are in that state.
+  const okrsDataByTeam = {};
+  const issuesByOKRForCards = {};
+  const okrCardNames = { 1: 'OKR1', 2: 'OKR2', 3: 'OKR3' };
+  MAIN_TEAMS.forEach(team => {
+    const teamDkrRows = dkrRowsByTeam[team] || [];
+    okrsDataByTeam[team] = [1, 2, 3].map(okrNum => {
+      const dkrsForOkr = teamDkrRows.filter(dkr => dkr.okrNum === okrNum);
+      const total = dkrsForOkr.length;
+      const open = dkrsForOkr.filter(dkr => OPEN_STATUSES.includes(dkr.parentState)).length;
+      const closed = dkrsForOkr.filter(dkr => dkr.parentState === 'Done').length;
+      const name = dkrsForOkr[0]?.projectName || okrCardNames[okrNum];
+      const projectUrl = dkrsForOkr[0]?.projectUrl || null;
+      if (dkrsForOkr.length > 0) {
+        issuesByOKRForCards[`${team}:${name}`] = dkrsForOkr.map(dkr => ({
+          id: dkr.identifier,
+          title: dkr.name,
+          team,
+          assignee: dkr.parentAssignee || 'Unassigned',
+          priority: dkr.parentPriority || 'None',
+          url: dkr.parentUrl || '',
+          state: dkr.parentState || 'Unknown',
+        }));
+      }
+      const completion = total > 0 ? Math.round((closed / total) * 100) : 0;
+      const hasOnHold = dkrsForOkr.some(dkr => dkr.parentState === 'On Hold');
+      const okrDueDates = dkrsForOkr.map(dkr => dkr.parentDueDate).filter(Boolean);
+      const latestDueDate = okrDueDates.length > 0 ? okrDueDates.sort().pop() : null;
+      const today = new Date().toISOString().slice(0, 10);
+      const isOverdue = latestDueDate != null && today > latestDueDate && completion < 100;
+      let status = 'blocked';
+      if (hasOnHold) status = 'blocked'; // On Hold prima: si algún DKR está On Hold → Blocked
+      else if (completion >= 100) status = 'done';
+      else if (isOverdue) status = 'at_risk'; // Se superó la fecha de vencimiento del OKR → At Risk
+      else if (completion >= 50) status = 'on_track';
+      else if (completion >= 25) status = 'at_risk';
+      const burndown = [
+        { day: 'Nov 7', remaining: total, ideal: total },
+        { day: 'Jan 2', remaining: open + Math.round(closed * 0.3), ideal: Math.round(total * 0.5) },
+        { day: new Date().toISOString().slice(0, 10), remaining: open, ideal: 0 },
+      ];
+      return { name, team, total, open, closed, completion, target: 100, status, url: projectUrl, burndown };
+    });
+  });
+  Object.assign(issuesByOKR, issuesByOKRForCards);
+
+  // Performance: incluir a quien tenga issues cerradas en MAIN_TEAMS (aunque no tenga open), para que aparezca en las cards (ej. Alfonso).
+  const assigneesForPerformance = [...new Set([
+    ...assignees,
+    ...closed.filter(r => MAIN_TEAMS.includes(r.team)).map(r => r.assignee),
+  ])].filter(a => a && a !== 'Unassigned');
   const performanceData = [];
-  assignees.forEach(a => {
+  assigneesForPerformance.forEach(a => {
     const personClosed = closed.filter(r => r.assignee === a && MAIN_TEAMS.includes(r.team));
     const closedWithDates = personClosed.filter(r => r.createdAt && r.completedAt);
     
@@ -701,7 +945,7 @@ function buildDashboardData(issues) {
     const nextMonday = new Date(weekStart);
     nextMonday.setDate(nextMonday.getDate() + 7);
     const weekEnd = nextMonday.toISOString().slice(0, 10);
-    const created = rows.filter(r => MAIN_TEAMS.includes(r.team) && r.createdAt && r.createdAt.slice(0, 10) >= weekStart && r.createdAt.slice(0, 10) < weekEnd).length;
+    const created = rowsActive.filter(r => MAIN_TEAMS.includes(r.team) && r.createdAt && r.createdAt.slice(0, 10) >= weekStart && r.createdAt.slice(0, 10) < weekEnd).length;
     const closed = closedForSla.filter(r => r.completedAt && r.completedAt.slice(0, 10) >= weekStart && r.completedAt.slice(0, 10) < weekEnd).length;
     let openEnd = totalOpen;
     for (let j = idx + 1; j < weekKeys.length; j++) {
@@ -709,7 +953,7 @@ function buildDashboardData(issues) {
       const we = new Date(ws);
       we.setDate(we.getDate() + 7);
       const weStr = we.toISOString().slice(0, 10);
-      const c = rows.filter(r => MAIN_TEAMS.includes(r.team) && r.createdAt && r.createdAt.slice(0, 10) >= ws && r.createdAt.slice(0, 10) < weStr).length;
+      const c = rowsActive.filter(r => MAIN_TEAMS.includes(r.team) && r.createdAt && r.createdAt.slice(0, 10) >= ws && r.createdAt.slice(0, 10) < weStr).length;
       const cl = closedForSla.filter(r => r.completedAt && r.completedAt.slice(0, 10) >= ws && r.completedAt.slice(0, 10) < weStr).length;
       openEnd += c - cl;
     }
@@ -743,9 +987,13 @@ function buildDashboardData(issues) {
     dataQualityIssues,
     weeklyData,
     cycleTimeData,
+    deletedIssueIds,
     issuesByStatus: byStatus,
     issuesByPriority: byPriority,
     issuesByShirtSize,
+    okrsDataByTeam,
+    dkrSummaryByTeam,
+    issuesByOKR,
     canceledIssues: canceledForAll.map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url })),
     duplicatedIssues: duplicatedForAll.map(r => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url })),
   };
@@ -848,6 +1096,11 @@ function formatAssigneeDetailedBlock(data) {
   return out;
 }
 
+function formatDeletedIssueIds(data) {
+  const ids = data.deletedIssueIds || [];
+  return `        const deletedIssueIds = new Set(${JSON.stringify(ids)});\n`;
+}
+
 function formatIssuesByStatus(data) {
   return `        const issuesByStatus = ${JSON.stringify(data.issuesByStatus)};\n`;
 }
@@ -943,8 +1196,78 @@ function formatDataQualityBlock(data) {
   return out;
 }
 
+function formatOkrDataByTeamBlock(data) {
+  const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '-');
+  const okrsByTeam = data.okrsDataByTeam || {};
+  let out = `        // OKR Data by Team (CARDS: only OKR 1, 2, 3 from Linear project)\n`;
+  out += `        // UPDATED FROM LINEAR - ${dateStr}\n`;
+  out += `        const okrsDataByTeam = {\n`;
+  ['Comp-leg', 'FCP', 'LTO', 'RPA'].forEach(team => {
+    const arr = okrsByTeam[team] || [];
+    out += `            '${team}': [\n`;
+    arr.forEach(okr => {
+      const safeName = (okr.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      out += `                {\n`;
+      out += `                    name: '${safeName}',\n`;
+      out += `                    team: '${okr.team}',\n`;
+      out += `                    total: ${okr.total}, open: ${okr.open}, closed: ${okr.closed},\n`;
+      out += `                    completion: ${okr.completion}, target: ${okr.target || 100},\n`;
+      out += `                    status: '${okr.status}',\n`;
+      out += `                    url: ${okr.url ? `'${String(okr.url).replace(/'/g, "\\'")}'` : 'null'},\n`;
+      out += `                    burndown: ${JSON.stringify(okr.burndown || [])}\n`;
+      out += `                },\n`;
+    });
+    out += `            ],\n`;
+  });
+  out += `        };\n\n`;
+  return out;
+}
+
+function formatDkrSummaryBlock(data) {
+  const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '-');
+  const dkrByTeam = data.dkrSummaryByTeam || {};
+  let out = `        // DKR Summary by Team (TABLE only - OKR Summary table rows)\n`;
+  out += `        // UPDATED FROM LINEAR - ${dateStr} (issues with DKR in title)\n`;
+  out += `        const dkrSummaryByTeam = {\n`;
+  ['Comp-leg', 'FCP', 'LTO', 'RPA'].forEach(team => {
+    const arr = dkrByTeam[team] || [];
+    out += `            '${team}': [\n`;
+    arr.forEach(row => {
+      const safeName = (row.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      const okrNum = row.okrNum != null ? row.okrNum : 'null';
+      out += `                { identifier: '${row.identifier || ''}', name: '${safeName}', team: '${row.team}', total: ${row.total}, open: ${row.open}, closed: ${row.closed}, completion: ${row.completion}, target: ${row.target || 100}, status: '${row.status}', okrNum: ${okrNum} },\n`;
+    });
+    out += `            ],\n`;
+  });
+  out += `        };\n\n`;
+  return out;
+}
+
+function formatIssuesByOKRBlock(data) {
+  const issuesByOKR = data.issuesByOKR || {};
+  let out = `        // Issues by OKR - from Linear (issues with "okr" label, grouped by OKR)\n`;
+  out += `        const issuesByOKR = {\n`;
+  Object.entries(issuesByOKR).forEach(([okrName, list]) => {
+    const safeName = okrName.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    out += `            '${safeName}': [\n`;
+    (list || []).forEach(issue => {
+      const title = (issue.title || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      const assignee = (issue.assignee || '').replace(/'/g, "\\'");
+      const state = (issue.state || '').replace(/'/g, "\\'");
+      out += `                { id: '${issue.id}', title: '${title}', team: '${issue.team}', assignee: '${assignee}', priority: '${issue.priority}', url: '${String(issue.url || '').replace(/'/g, "\\'")}', state: '${state}' },\n`;
+    });
+    out += `            ],\n`;
+  });
+  out += `        };\n\n`;
+  return out;
+}
+
 function transformMCPToSyncFormat(mcpIssues) {
-  return mcpIssues.map(issue => ({
+  return mcpIssues.map(issue => {
+    const stateName = issue.status || issue.state?.name || '';
+    const isDeletedState = /canceled|duplicate|deleted|archived|trashed|restore/i.test(stateName);
+    const trashed = !!(issue.trashed ?? issue.trashedAt ?? isDeletedState);
+    return {
     id: issue.id,
     identifier: issue.identifier,
     title: issue.title,
@@ -953,6 +1276,7 @@ function transformMCPToSyncFormat(mcpIssues) {
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
     completedAt: issue.completedAt,
+    trashed,
     priority: issue.priority?.value ?? issue.priority ?? 4,
     state: {
       name: issue.status || issue.state?.name || 'Unknown',
@@ -973,7 +1297,8 @@ function transformMCPToSyncFormat(mcpIssues) {
     labels: {
       nodes: (issue.labels || []).map(l => ({ name: typeof l === 'string' ? l : l.name || l }))
     }
-  }));
+  };
+  });
 }
 
 async function main() {
@@ -1051,6 +1376,13 @@ async function main() {
     html = html.slice(0, performanceStart) + performanceBlock + html.slice(performanceEnd + '        ];\n\n'.length);
   }
 
+  // Deleted/trashed issue IDs (excluded from sidebar when clicking bars)
+  const deletedIdsStart = html.indexOf('        const deletedIssueIds = new Set(');
+  const deletedIdsEnd = html.indexOf(');\n', deletedIdsStart);
+  if (deletedIdsStart !== -1 && deletedIdsEnd !== -1) {
+    html = html.slice(0, deletedIdsStart) + formatDeletedIssueIds(data) + html.slice(deletedIdsEnd + 2);
+  }
+
   const isbStart = html.indexOf('        const issuesByStatus = ');
   const isbEnd = html.indexOf(';\n        const issuesByPriority = ', isbStart);
   if (isbStart !== -1 && isbEnd !== -1) {
@@ -1074,6 +1406,20 @@ async function main() {
   const qualityDataEnd = html.indexOf('        };\n\n        // Issues by Status', qualityDataStart);
   if (qualityDataStart !== -1 && qualityDataEnd !== -1) {
     html = html.slice(0, qualityDataStart) + dataQualityBlock + html.slice(qualityDataEnd + '        };\n\n'.length);
+  }
+
+  // OKR Data by Team (cards: OKR 1,2,3) + DKR Summary (table rows)
+  const okrDataByTeamStart = html.indexOf('        // OKR Data by Team');
+  const okrLegacyStart = html.indexOf('        // Legacy okrsData', okrDataByTeamStart);
+  if (okrDataByTeamStart !== -1 && okrLegacyStart !== -1) {
+    html = html.slice(0, okrDataByTeamStart) + formatOkrDataByTeamBlock(data) + formatDkrSummaryBlock(data) + html.slice(okrLegacyStart);
+  }
+
+  // Issues by OKR (for sidebar)
+  const issuesByOKRStart = html.indexOf('        // Issues by OKR');
+  const issuesByOKREnd = html.indexOf('        // Extended overdue issues by team', issuesByOKRStart);
+  if (issuesByOKRStart !== -1 && issuesByOKREnd !== -1) {
+    html = html.slice(0, issuesByOKRStart) + formatIssuesByOKRBlock(data) + html.slice(issuesByOKREnd);
   }
 
   fs.writeFileSync(htmlPath, html);
