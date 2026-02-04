@@ -14,6 +14,9 @@ const HTML_FILE = path.join(__dirname, 'compliance_dashboard_v14_roxom (1).html'
 const PRIORITY_MAP = { 0: 'None', 1: 'Urgent', 2: 'High', 3: 'Medium', 4: 'Low' };
 const SHIRT_LABELS = ['XS', 'S', 'M', 'L', 'XL'];
 const OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress', 'In Review', 'On Hold', 'Pending Signature'];
+// PGA: Pending Signature counts as DONE (closed), not open
+const PGA_OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress', 'In Review', 'On Hold'];
+const PGA_CLOSED_STATES = ['Done', 'Canceled', 'Ongoing', 'Ended', 'Pending Signature'];
 const MAIN_TEAMS = ['Comp-leg', 'FCP', 'LTO', 'RPA'];
 const TEAM_NAME_MAP = {
   'Comp-leg': 'Comp-leg',
@@ -23,7 +26,18 @@ const TEAM_NAME_MAP = {
   'Regulatory Public Affairs': 'RPA',
   'PGA': 'PGA',
 };
-const PRIORITY_ORDER = ['Urgent', 'High', 'Medium', 'Low', 'None'];
+const STATUS_ORDER = ['Backlog', 'In Progress', 'Ongoing', 'On Hold', 'Todo', 'In Review', 'Pending Signature', 'Triage'];
+const PRIORITY_ORDER = ['None', 'Low', 'Medium', 'High', 'Urgent'];
+function sortByStatusOrder(arr) {
+  return arr.slice().sort((a, b) => {
+    const i = STATUS_ORDER.indexOf(a.status);
+    const j = STATUS_ORDER.indexOf(b.status);
+    if (i === -1 && j === -1) return 0;
+    if (i === -1) return 1;
+    if (j === -1) return -1;
+    return i - j;
+  });
+}
 
 function normalizeTeam(teamName) {
   return TEAM_NAME_MAP[teamName] || teamName;
@@ -106,13 +120,16 @@ function buildDashboardData(issues) {
 
   const allTeamKeys = [...new Set(rows.map(r => r.team))].filter(t => t && t !== 'Unknown');
   if (allTeamKeys.includes('PGA')) {
-    const teamOpen = open.filter(r => r.team === 'PGA');
-    const teamClosed = closed.filter(r => r.team === 'PGA');
+    const pgaRows = rows.filter(r => r.team === 'PGA');
+    const norm = (s) => (s || '').trim().toLowerCase();
+    const teamOpen = pgaRows.filter(r => r.state && PGA_OPEN_STATUSES.some(open => norm(open) === norm(r.state)));
+    const teamClosed = pgaRows.filter(r => r.state && PGA_CLOSED_STATES.some(closed => norm(closed) === norm(r.state)));
+    const pgaOverdue = teamOpen.filter(r => r.dueDate && r.dueDate < today);
     byTeam['PGA'] = { 
       team: 'PGA', 
       open: teamOpen.length, 
       closed: teamClosed.length, 
-      overdue: overdue.filter(r => r.team === 'PGA').length, 
+      overdue: pgaOverdue.length, 
       velocity: (teamClosed.length / 10).toFixed(1), 
       closedWithDueDate: 0, 
       closedOnTime: 0, 
@@ -158,7 +175,10 @@ function buildDashboardData(issues) {
   const totalClosed = closed.filter(r => MAIN_TEAMS.includes(r.team)).length;
   const total = rows.filter(r => MAIN_TEAMS.includes(r.team)).length;
 
-  const byStatusArr = Object.entries(byStatus).map(([status, list]) => ({ status, count: list.length }));
+  const byStatusArr = [
+    ...STATUS_ORDER.filter(s => (byStatus[s] || []).length > 0).map(s => ({ status: s, count: (byStatus[s] || []).length })),
+    ...Object.entries(byStatus).filter(([s]) => !STATUS_ORDER.includes(s)).map(([status, list]) => ({ status, count: list.length })),
+  ];
   const byPriorityArr = PRIORITY_ORDER.map(p => ({ priority: p, count: (byPriority[p] || []).length }));
 
   const byShirtSize = {};
@@ -221,7 +241,7 @@ function buildDashboardData(issues) {
       open: teamOpen.length,
       closed: closed.filter(r => r.team === teamKey).length,
       overdue: teamOverdue.length,
-      byStatus: Object.entries(statusCounts).map(([status, count]) => ({ status, count })),
+      byStatus: sortByStatusOrder(Object.entries(statusCounts).map(([status, count]) => ({ status, count }))),
       byPriority: PRIORITY_ORDER.map(p => ({ priority: p, count: (priorityCounts[p] || 0) })),
       byShirtSize: Object.entries(shirtCounts).map(([size, count]) => ({ size, count })),
       overdueIssues: overdueIssues.filter(i => i.team === teamKey),
@@ -245,7 +265,7 @@ function buildDashboardData(issues) {
       closed: personClosed.length,
       overdue: personOverdue.length,
       weighted,
-      byStatus: Object.entries(statusCounts).map(([status, count]) => ({ status, count })),
+      byStatus: sortByStatusOrder(Object.entries(statusCounts).map(([status, count]) => ({ status, count }))),
       byPriority: PRIORITY_ORDER.map(p => ({ priority: p, count: (priorityCounts[p] || 0) })),
       byShirtSize: Object.entries(shirtCounts).map(([size, count]) => ({ size, count })),
       overdueIssues: overdueIssues.filter(i => i.assignee === a),

@@ -16,9 +16,9 @@ const PRIORITY_MAP = { 0: 'None', 1: 'Urgent', 2: 'High', 3: 'Medium', 4: 'Low' 
 const SHIRT_LABELS = ['XS', 'S', 'M', 'L', 'XL'];
 // Open = only these statuses (sum of Backlog + Todo + In Progress + In Review + On Hold) - excludes Pending Signature (PGA label)
 const OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress', 'In Review', 'On Hold'];
-// PGA performance: custom status mapping (done = on going, ended; open = backlog, todo, in progress, pending signature)
-const PGA_OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress', 'Pending Signature'];
-const PGA_CLOSED_STATUSES = ['On Going', 'Ongoing', 'Ended'];
+// PGA performance: custom status mapping. Done = On Going, Ended, Pending Signature; open = Backlog, Todo, In Progress.
+const PGA_OPEN_STATUSES = ['Backlog', 'Todo', 'In Progress'];
+const PGA_CLOSED_STATUSES = ['On Going', 'Ongoing', 'Ended', 'Pending Signature'];
 
 function isPgaOpen(row) {
   const s = (row.state || '').trim();
@@ -38,7 +38,19 @@ function isEliminatedState(state) {
   return false;
 }
 const MAIN_TEAMS = ['Comp-leg', 'FCP', 'LTO', 'RPA']; // All = sum of these 4 (excludes PGA)
-const PRIORITY_ORDER = ['Urgent', 'High', 'Medium', 'Low', 'None']; // fixed order so By Priority chart always shows labels in All tab
+// Order for By Status chart (all tabs) – match dashboard layout
+const STATUS_ORDER = ['Backlog', 'In Progress', 'Ongoing', 'On Hold', 'Todo', 'In Review', 'Pending Signature', 'Triage'];
+const PRIORITY_ORDER = ['None', 'Low', 'Medium', 'High', 'Urgent']; // fixed order for By Priority chart (all tabs)
+function sortByStatusOrder(arr) {
+  return arr.slice().sort((a, b) => {
+    const i = STATUS_ORDER.indexOf(a.status);
+    const j = STATUS_ORDER.indexOf(b.status);
+    if (i === -1 && j === -1) return 0;
+    if (i === -1) return 1;
+    if (j === -1) return -1;
+    return i - j;
+  });
+}
 // Display name for assignees (Linear name → dashboard label)
 const ASSIGNEE_DISPLAY_NAMES = { sofita: 'Sofia' };
 function assigneeDisplayName(name) {
@@ -276,6 +288,60 @@ function getISOWeekKey(dateStr) {
   return { key: `${y}-W${String(w).padStart(2, '0')}`, weekNum: w, year: y, monday: monday.toISOString().slice(0, 10) };
 }
 
+/** Build week-by-week burndown from DKR parents: due dates + completion. Each DKR has parentCreatedAt, parentCompletedAt, parentDueDate, parentState. */
+function buildOkrBurndown(dkrsForOkr, today) {
+  if (!dkrsForOkr || dkrsForOkr.length === 0) {
+    return [{ day: today, remaining: 0, ideal: 0 }];
+  }
+  const total = dkrsForOkr.length;
+  const createdDates = dkrsForOkr.map(d => d.parentCreatedAt).filter(Boolean);
+  const dueDates = dkrsForOkr.map(d => d.parentDueDate).filter(Boolean);
+  const startDate = createdDates.length > 0 ? [...createdDates].sort()[0].slice(0, 10) : today;
+  const latestDue = dueDates.length > 0 ? [...dueDates].sort().pop() : null;
+  const endDate = latestDue && latestDue > today ? latestDue : today;
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (end < start) end.setTime(start.getTime());
+  const spanMs = end - start || 1;
+
+  const weeks = [];
+  weeks.push({ day: startDate, remaining: total, ideal: total });
+
+  const weekStart = new Date(start);
+  const dayOfWeek = weekStart.getDay();
+  const toMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+  weekStart.setDate(weekStart.getDate() + toMonday);
+
+  while (weekStart <= end) {
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 6);
+    const weekEndStr = weekEnd.toISOString().slice(0, 10);
+    const remaining = dkrsForOkr.filter(dkr => {
+      if (dkr.parentState === 'Done' && dkr.parentCompletedAt) {
+        return dkr.parentCompletedAt.slice(0, 10) > weekEndStr;
+      }
+      return true;
+    }).length;
+    const weekProgress = (weekEnd - start) / spanMs;
+    const ideal = Math.max(0, Math.round(total * (1 - weekProgress)));
+    weeks.push({
+      day: weekEndStr,
+      remaining,
+      ideal: Math.min(total, ideal),
+    });
+    weekStart.setDate(weekStart.getDate() + 7);
+  }
+
+  if (weeks[weeks.length - 1].day !== today) {
+    weeks.push({
+      day: today,
+      remaining: dkrsForOkr.filter(dkr => dkr.parentState !== 'Done').length,
+      ideal: 0,
+    });
+  }
+  return weeks;
+}
+
 function getLast11WeekKeys() {
   const out = [];
   const now = new Date();
@@ -375,7 +441,7 @@ function buildDashboardData(issues) {
   // Add PGA if present in data (for teamDetailedData only; not in summaryStats.byTeam)
   const allTeamKeys = [...new Set(rowsActive.map(r => r.team))].filter(t => t && t !== 'Unknown');
   if (allTeamKeys.includes('PGA')) {
-    // PGA performance: done = On Going, Ended; open = Backlog, Todo, In Progress, Pending Signature (sin eliminated)
+    // PGA performance: done = On Going, Ended, Pending Signature; open = Backlog, Todo, In Progress (sin eliminated)
     const teamOpen = rowsActive.filter(r => r.team === 'PGA' && isPgaOpen(r));
     const teamClosed = rowsActive.filter(r => r.team === 'PGA' && isPgaClosed(r));
     const teamClosedIn10Weeks = teamClosed.filter(r => inLastNWeeks(r.completedAt, 10));
@@ -430,6 +496,33 @@ function buildDashboardData(issues) {
     url: r.url,
   }));
 
+  const noDueDateIssues = openForAll.filter(r => !r.dueDate).map(r => ({
+    id: r.id,
+    title: r.title,
+    team: r.team,
+    assignee: r.assignee,
+    priority: r.priority,
+    url: r.url,
+  }));
+
+  // PGA "closed" = On Going, Ongoing, Ended, Pending Signature (for sidebar when By Team → PGA)
+  const pgaClosedIssues = rowsActive
+    .filter(r => r.team === 'PGA' && isPgaClosed(r))
+    .map(r => ({
+      id: r.id,
+      title: r.title,
+      team: r.team,
+      assignee: r.assignee,
+      priority: r.priority,
+      url: r.url,
+      completedAt: r.completedAt,
+      createdAt: r.createdAt,
+    }))
+    .sort((a, b) => {
+      if (a.completedAt && b.completedAt) return new Date(b.completedAt) - new Date(a.completedAt);
+      return 0;
+    });
+
   // List of all closed issues for the sidebar
   const closedIssues = closed
     .filter(r => ALL_TEAMS.includes(r.team))
@@ -451,8 +544,11 @@ function buildDashboardData(issues) {
       return 0;
     });
 
-  // Calculate totalOpen as sum of byStatus to ensure consistency
-  const byStatusArr = Object.entries(byStatus).map(([status, list]) => ({ status, count: list.length }));
+  // Calculate totalOpen as sum of byStatus to ensure consistency; order by STATUS_ORDER
+  const byStatusArr = [
+    ...STATUS_ORDER.filter(s => (byStatus[s] || []).length > 0).map(s => ({ status: s, count: (byStatus[s] || []).length })),
+    ...Object.entries(byStatus).filter(([s]) => !STATUS_ORDER.includes(s)).map(([status, list]) => ({ status, count: list.length })),
+  ];
   const totalOpen = byStatusArr.reduce((sum, item) => sum + item.count, 0); // Sum of all statuses = totalOpen
   const totalClosed = closed.filter(r => ALL_TEAMS.includes(r.team)).length;
   const total = rowsActive.filter(r => ALL_TEAMS.includes(r.team)).length;
@@ -583,7 +679,9 @@ function buildDashboardData(issues) {
     byAssignee: Object.values(byAssignee),
     overdueIssues,
     dueSoonIssues,
+    noDueDateIssues,
     closedIssues,
+    pgaClosedIssues,
     canceledCount: canceledForAll.length,
     duplicatedCount: duplicatedForAll.length,
     canceledByTeam,
@@ -620,7 +718,7 @@ function buildDashboardData(issues) {
       open: teamOpen.length,
       closed: closed.filter(r => r.team === teamKey).length,
       overdue: teamOverdue.length,
-      byStatus: Object.entries(statusCounts).map(([status, count]) => ({ status, count })),
+      byStatus: sortByStatusOrder(Object.entries(statusCounts).map(([status, count]) => ({ status, count }))),
       byPriority: PRIORITY_ORDER.map(p => ({ priority: p, count: (priorityCounts[p] || 0) })),
       byShirtSize: Object.entries(shirtCounts).filter(([size, count]) => count > 0).map(([size, count]) => ({ size, count })),
       overdueIssues: overdueIssues.filter(i => i.team === teamKey),
@@ -659,7 +757,7 @@ function buildDashboardData(issues) {
       closed: personClosed.length,
       overdue: personOverdue.length,
       weighted,
-      byStatus: Object.entries(statusCounts).map(([status, count]) => ({ status, count })),
+      byStatus: sortByStatusOrder(Object.entries(statusCounts).map(([status, count]) => ({ status, count }))),
       byPriority: PRIORITY_ORDER.map(p => ({ priority: p, count: (priorityCounts[p] || 0) })),
       byShirtSize: Object.entries(shirtCounts).filter(([size, count]) => count > 0).map(([size, count]) => ({ size, count })),
       overdueIssues: overdueIssues.filter(i => i.assignee === a),
@@ -735,6 +833,7 @@ function buildDashboardData(issues) {
       dkrRowsByTeam[team].push({
         identifier: r.id, name: r.title, team, total, open, closed, completion, status, okrNum, projectName, projectUrl, list,
         parentState: r.state, parentAssignee: r.assignee, parentUrl: r.url, parentPriority: r.priority, parentDueDate: r.dueDate,
+        parentCreatedAt: r.createdAt, parentCompletedAt: r.completedAt,
       });
     });
   });
@@ -775,11 +874,7 @@ function buildDashboardData(issues) {
       else if (isOverdue) status = 'at_risk'; // Se superó la fecha de vencimiento del OKR → At Risk
       else if (completion >= 50) status = 'on_track';
       else if (completion >= 25) status = 'at_risk';
-      const burndown = [
-        { day: 'Nov 7', remaining: total, ideal: total },
-        { day: 'Jan 2', remaining: open + Math.round(closed * 0.3), ideal: Math.round(total * 0.5) },
-        { day: new Date().toISOString().slice(0, 10), remaining: open, ideal: 0 },
-      ];
+      const burndown = buildOkrBurndown(dkrsForOkr, today);
       return { name, team, total, open, closed, completion, target: 100, status, url: projectUrl, burndown };
     });
   });
@@ -1042,6 +1137,7 @@ function formatSummaryStatsBlock(data) {
   });
   out += `            ],\n`;
   out += `            dueSoonIssues: ${JSON.stringify(s.dueSoonIssues)},\n`;
+  out += `            noDueDateIssues: ${JSON.stringify(s.noDueDateIssues || [])},\n`;
   out += `            closedIssues: [\n`;
   s.closedIssues.forEach(i => {
     const title = (i.title || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
@@ -1049,6 +1145,7 @@ function formatSummaryStatsBlock(data) {
     out += `                { id: '${i.id}', title: '${title}', team: '${i.team}', assignee: '${assignee}', priority: '${i.priority}', url: '${i.url}', completedAt: '${i.completedAt || ''}', createdAt: '${i.createdAt || ''}' },\n`;
   });
   out += `            ],\n`;
+  out += `            pgaClosedIssues: ${JSON.stringify(s.pgaClosedIssues || [])},\n`;
   out += `            canceledCount: ${s.canceledCount},\n`;
   out += `            duplicatedCount: ${s.duplicatedCount},\n`;
   out += `            canceledByTeam: ${JSON.stringify(s.canceledByTeam)},\n`;
