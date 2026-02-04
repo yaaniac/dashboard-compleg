@@ -3006,13 +3006,25 @@
             };
 
             const handleShirtSizeClick = (chartData) => {
-                if (chartData && chartData.activePayload && chartData.activePayload[0]) {
-                    const size = chartData.activePayload[0].payload.size;
+                const payload = (chartData && chartData.activePayload && chartData.activePayload[0] && chartData.activePayload[0].payload)
+                    || (chartData && chartData.payload);
+                if (payload && payload.size != null) {
+                    const size = payload.size;
                     let issues = [];
                     if (selectedTeam === 'All') {
-                        issues = filterActiveIssues(issuesByShirtSize[size] || []);
+                        // Aggregate from each team (Comp-leg, FCP, LTO, RPA) – same scope as By Team > All
+                        const teamsForAll = ['Comp-leg', 'FCP', 'LTO', 'RPA'];
+                        teamsForAll.forEach(team => {
+                            const teamData = teamDetailedData[team];
+                            if (teamData && teamData.issuesByShirtSize && teamData.issuesByShirtSize[size]) {
+                                issues = issues.concat(teamData.issuesByShirtSize[size]);
+                            }
+                        });
+                        issues = filterActiveIssues(issues);
                     } else if (isPGA) {
-                        issues = filterActiveIssues((issuesByShirtSize[size] || []).filter(i => i.team === 'PGA'));
+                        const teamData = teamDetailedData['PGA'];
+                        const bySize = (teamData && teamData.issuesByShirtSize) || {};
+                        issues = filterActiveIssues((bySize[size] || bySize['N/A'] || []).filter(i => i.team === 'PGA'));
                     } else {
                         const teamData = teamDetailedData[selectedTeam];
                         issues = filterActiveIssues((teamData && teamData.issuesByShirtSize && teamData.issuesByShirtSize[size]) || []);
@@ -3181,7 +3193,7 @@
                                         <XAxis dataKey="size" />
                                         <YAxis />
                                         <Tooltip />
-                                        <Bar dataKey="count" fill="#22c55e" />
+                                        <Bar dataKey="count" fill="#22c55e" onClick={(chartData, index) => { if (chartData && chartData[index]) handleShirtSizeClick({ payload: chartData[index] }); }} cursor="pointer" />
                                     </BarChart>
                                 </ResponsiveContainer>
                             </div>
@@ -3437,11 +3449,20 @@
             };
 
             const handleShirtSizeClick = (chartData) => {
-                if (chartData && chartData.activePayload && chartData.activePayload[0]) {
-                    const size = chartData.activePayload[0].payload.size;
+                const payload = (chartData && chartData.activePayload && chartData.activePayload[0] && chartData.activePayload[0].payload)
+                    || (chartData && chartData.payload);
+                if (payload && payload.size != null) {
+                    const size = payload.size;
                     let issues = [];
                     if (selectedPerson === 'All') {
-                        issues = filterActiveIssues(issuesByShirtSize[size] || []);
+                        // Aggregate from each person in assigneeDetailedData (same scope as By Person > All)
+                        Object.keys(assigneeDetailedData || {}).forEach(person => {
+                            const personData = assigneeDetailedData[person];
+                            if (personData && personData.issuesByShirtSize && personData.issuesByShirtSize[size]) {
+                                issues = issues.concat(personData.issuesByShirtSize[size]);
+                            }
+                        });
+                        issues = filterActiveIssues(issues);
                     } else {
                         const personData = assigneeDetailedData[selectedPerson];
                         issues = filterActiveIssues((personData && personData.issuesByShirtSize && personData.issuesByShirtSize[size]) || []);
@@ -3556,7 +3577,7 @@
                                     <XAxis dataKey="size" />
                                     <YAxis />
                                     <Tooltip />
-                                    <Bar dataKey="count" fill="#22c55e" />
+                                    <Bar dataKey="count" fill="#22c55e" onClick={(chartData, index) => { if (chartData && chartData[index]) handleShirtSizeClick({ payload: chartData[index] }); }} cursor="pointer" />
                                 </BarChart>
                             </ResponsiveContainer>
                         </div>
