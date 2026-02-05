@@ -866,6 +866,9 @@ function buildDashboardData(issues) {
     if (/OKR\s*1\b/i.test(s)) return 1;
     if (/OKR\s*2\b/i.test(s)) return 2;
     if (/OKR\s*3\b/i.test(s)) return 3;
+    if (/OKR\s*4\b/i.test(s)) return 4;
+    if (/OKR\s*5\b/i.test(s)) return 5;
+    if (/OKR\s*6\b/i.test(s)) return 6;
     return null;
   };
 
@@ -926,13 +929,14 @@ function buildDashboardData(issues) {
     });
   });
 
-  // OKR 1, 2, 3 CARDS: count only DKR parent issues (not sub-issues). Open/Done = how many DKRs are in that state.
+  // OKR 1–6 CARDS: count only DKR parent issues (not sub-issues). Open/Done = how many DKRs are in that state.
   const okrsDataByTeam = {};
   const issuesByOKRForCards = {};
-  const okrCardNames = { 1: 'OKR1', 2: 'OKR2', 3: 'OKR3' };
+  const okrCardNames = { 1: 'OKR1', 2: 'OKR2', 3: 'OKR3', 4: 'OKR4', 5: 'OKR5', 6: 'OKR6' };
+  const okrSlots = [1, 2, 3, 4, 5, 6];
   MAIN_TEAMS.forEach(team => {
     const teamDkrRows = dkrRowsByTeam[team] || [];
-    okrsDataByTeam[team] = [1, 2, 3].map(okrNum => {
+    okrsDataByTeam[team] = okrSlots.map(okrNum => {
       const dkrsForOkr = teamDkrRows.filter(dkr => dkr.okrNum === okrNum);
       const total = dkrsForOkr.length;
       const open = dkrsForOkr.filter(dkr => OPEN_STATUSES.includes(dkr.parentState)).length;
