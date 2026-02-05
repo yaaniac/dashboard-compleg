@@ -54,6 +54,28 @@ function isEliminatedState(state) {
   return false;
 }
 const MAIN_TEAMS = ['Comp-leg', 'FCP', 'LTO', 'RPA']; // All = sum of these 4 (excludes PGA)
+
+/** OKR number from project name (1–6). Used for Comp-leg project list and DKR grouping. */
+function getOkrNumFromProjectName(projectName) {
+  if (!projectName || typeof projectName !== 'string') return null;
+  const s = String(projectName).trim();
+  if (/OKR\s*1\b/i.test(s)) return 1;
+  if (/OKR\s*2\b/i.test(s)) return 2;
+  if (/OKR\s*3\b/i.test(s)) return 3;
+  if (/OKR\s*4\b/i.test(s)) return 4;
+  if (/OKR\s*5\b/i.test(s)) return 5;
+  if (/OKR\s*6\b/i.test(s)) return 6;
+  return null;
+}
+
+function isCompLegOkrProjectName(projectName) {
+  if (!projectName || typeof projectName !== 'string') return false;
+  const p = String(projectName).trim();
+  if (getOkrNumFromProjectName(p) == null) return false;
+  if (/daily\s*task/i.test(p)) return false;
+  if (/cse\s*&\s*legal/i.test(p)) return false;
+  return true;
+}
 // Order for By Status chart (all tabs) – match dashboard layout
 const STATUS_ORDER = ['Backlog', 'In Progress', 'Ongoing', 'On Hold', 'Todo', 'In Review', 'Pending Signature', 'Triage'];
 const PRIORITY_ORDER = ['None', 'Low', 'Medium', 'High', 'Urgent']; // fixed order for By Priority chart (all tabs)
@@ -135,8 +157,71 @@ async function fetchAllIssues() {
   return issues;
 }
 
+/** Fetch projects and return { projectStateMap, compLegOkrProjectNames }.
+ * projectStateMap: projectName -> stateName (Released = done, Not Achieved = no_achieved, resto = open).
+ * compLegOkrProjectNames: [nameOKR1, nameOKR2, nameOKR3] para mostrar nombre real del OKR en Comp-leg. */
+async function fetchProjectStates() {
+  const map = new Map();
+  const allProjects = [];
+  let cursor = null;
+  const query = `
+    query Projects($first: Int!, $after: String) {
+      projects(first: $first, after: $after) {
+        nodes {
+          id
+          name
+          state
+          team { id key name }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  `;
+  try {
+    do {
+      const res = await linearRequest(query, { first: 100, after: cursor });
+      if (res.errors) return { projectStateMap: map, compLegOkrProjectNames: [] };
+      const nodes = res.data?.projects?.nodes || [];
+      nodes.forEach((p) => {
+        if (!p.name) return;
+        const stateName = (p.state && typeof p.state === 'object' && p.state.name)
+          ? p.state.name
+          : (typeof p.state === 'string' ? p.state : '');
+        map.set(p.name.trim(), String(stateName).trim());
+        allProjects.push(p);
+      });
+      cursor = res.data?.projects?.pageInfo?.hasNextPage ? res.data.projects.pageInfo.endCursor : null;
+    } while (cursor);
+  } catch (_) { /* ignore */ }
+
+  // Comp-leg: solo proyectos OKR (excluir Daily Tasks, CSE & Legal), ordenados por OKR 1, 2, 3
+  const compLegKey = (t) => (t && (t.key || t.name || '')).toLowerCase().replace(/\s+/g, ' ');
+  const isCompLegTeam = (t) => {
+    if (!t) return false;
+    const k = compLegKey(t);
+    return k === 'comp-leg' || k === 'compleg' || k === 'compliance & legal' || k === 'compliance and legal' || k.includes('comp-leg') || k.includes('compleg');
+  };
+  const compLegOkrProjects = allProjects
+    .filter((p) => p.team && isCompLegTeam(p.team) && isCompLegOkrProjectName(p.name))
+    .sort((a, b) => {
+      const na = getOkrNumFromProjectName(a.name);
+      const nb = getOkrNumFromProjectName(b.name);
+      if (na == null && nb == null) return 0;
+      if (na == null) return 1;
+      if (nb == null) return -1;
+      return na - nb;
+    });
+  const compLegOkrProjectNames = [1, 2, 3].map((n) => compLegOkrProjects.find((p) => getOkrNumFromProjectName(p.name) === n)?.name).filter(Boolean);
+
+  return { projectStateMap: map, compLegOkrProjectNames };
+}
+
 const TEAM_NAME_MAP = {
   'Comp-leg': 'Comp-leg',
+  'Compleg': 'Comp-leg',
+  'COMPLEG': 'Comp-leg',
+  'Compliance & Legal': 'Comp-leg',
+  'Compliance and Legal': 'Comp-leg',
   'Financial Crime Prevention': 'FCP',
   'Legal Tech Operations': 'LTO',
   'Regulatory and Public Affairs': 'RPA',
@@ -173,6 +258,10 @@ function getDkrDashboardTeam(dkrRow) {
 
 function normalizeTeam(teamName, teamKey) {
   if (TEAM_NAME_MAP[teamName]) return TEAM_NAME_MAP[teamName];
+  // Linear puede devolver key "Compleg" (sin guión) → unificar a "Comp-leg"
+  const keyNorm = (teamKey && String(teamKey).trim()) || '';
+  if (TEAM_NAME_MAP[keyNorm]) return TEAM_NAME_MAP[keyNorm];
+  if (keyNorm.toLowerCase() === 'compleg') return 'Comp-leg';
   if (teamKey && ['Comp-leg', 'FCP', 'LTO', 'RPA', 'PGA'].includes(teamKey)) return teamKey;
   return teamName || 'Unknown';
 }
@@ -304,6 +393,54 @@ function getISOWeekKey(dateStr) {
   return { key: `${y}-W${String(w).padStart(2, '0')}`, weekNum: w, year: y, monday: monday.toISOString().slice(0, 10) };
 }
 
+/** Build week-by-week burndown from issue rows (createdAt, completedAt, dueDate, state). Used for Comp-leg OKR when data comes from issues, not DKRs. */
+function buildBurndownFromIssues(rows, today) {
+  if (!rows || rows.length === 0) return [{ day: today, remaining: 0, ideal: 0 }];
+  const total = rows.length;
+  const createdDates = rows.map((r) => r.createdAt && r.createdAt.slice(0, 10)).filter(Boolean);
+  const dueDates = rows.map((r) => r.dueDate && (typeof r.dueDate === 'string' ? r.dueDate.slice(0, 10) : r.dueDate)).filter(Boolean);
+  const startDate = createdDates.length > 0 ? [...createdDates].sort()[0] : today;
+  const latestDue = dueDates.length > 0 ? [...dueDates].sort().pop() : null;
+  const endDate = latestDue && latestDue > today ? latestDue : today;
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (end < start) end.setTime(start.getTime());
+  const spanMs = end - start || 1;
+
+  const weeks = [];
+  weeks.push({ day: startDate, remaining: total, ideal: total });
+
+  const weekStart = new Date(start);
+  const dayOfWeek = weekStart.getDay();
+  const toMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+  weekStart.setDate(weekStart.getDate() + toMonday);
+
+  while (weekStart <= end) {
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 6);
+    const weekEndStr = weekEnd.toISOString().slice(0, 10);
+    const remaining = rows.filter((r) => {
+      if (r.state === 'Done' && r.completedAt) {
+        return r.completedAt.slice(0, 10) > weekEndStr;
+      }
+      return true;
+    }).length;
+    const weekProgress = (weekEnd - start) / spanMs;
+    const ideal = Math.max(0, Math.round(total * (1 - weekProgress)));
+    weeks.push({ day: weekEndStr, remaining, ideal: Math.min(total, ideal) });
+    weekStart.setDate(weekStart.getDate() + 7);
+  }
+
+  if (weeks[weeks.length - 1].day !== today) {
+    weeks.push({
+      day: today,
+      remaining: rows.filter((r) => r.state !== 'Done').length,
+      ideal: 0,
+    });
+  }
+  return weeks;
+}
+
 /** Build week-by-week burndown from DKR parents: due dates + completion. Each DKR has parentCreatedAt, parentCompletedAt, parentDueDate, parentState. */
 function buildOkrBurndown(dkrsForOkr, today) {
   if (!dkrsForOkr || dkrsForOkr.length === 0) {
@@ -373,7 +510,7 @@ function getLast11WeekKeys() {
   return out;
 }
 
-function buildDashboardData(issues) {
+function buildDashboardData(issues, projectStateMap = null, compLegOkrProjectNames = []) {
   const rows = issues.map(toIssueRow);
   // NINGUNA métrica debe incluir issues eliminadas: trashed, estado Deleted/Canceled/Duplicate/Archived/Trashed, ni sin asignar.
   // rowsActive = única base para open/closed/byTeam/byAssignee/velocity/SLA/cycleTime/weeklyData/qualityData/OKR.
@@ -860,18 +997,6 @@ function buildDashboardData(issues) {
 
   const okrRowToIssue = (r) => ({ id: r.id, title: r.title, team: r.team, assignee: r.assignee, priority: r.priority, url: r.url });
 
-  const getOkrNumFromProject = (projectName) => {
-    if (!projectName) return null;
-    const s = String(projectName);
-    if (/OKR\s*1\b/i.test(s)) return 1;
-    if (/OKR\s*2\b/i.test(s)) return 2;
-    if (/OKR\s*3\b/i.test(s)) return 3;
-    if (/OKR\s*4\b/i.test(s)) return 4;
-    if (/OKR\s*5\b/i.test(s)) return 5;
-    if (/OKR\s*6\b/i.test(s)) return 6;
-    return null;
-  };
-
   // DKR data first: one row per top-level DKR (parentId === null, title contains "DKR").
   // Team = parent assignee or, if parent not in MAIN_TEAMS, first child assignee in ASSIGNEE_TO_TEAM (so DKR with yani's sub-issues shows under FCP).
   const dkrTitleRe = /DKR\s*(\d+)/i;
@@ -887,7 +1012,7 @@ function buildDashboardData(issues) {
   MAIN_TEAMS.forEach(t => { dkrRowsByTeam[t] = []; });
 
   MAIN_TEAMS.forEach(team => {
-    const teamDkrs = dkrParentIssues
+    let teamDkrs = dkrParentIssues
       .filter(r => getDkrDashboardTeam(r) === team)
       .sort((a, b) => {
         const na = (a.title || '').match(dkrTitleRe);
@@ -896,6 +1021,12 @@ function buildDashboardData(issues) {
         const numB = nb ? parseInt(nb[1], 10) : 999;
         return numA !== numB ? numA - numB : (a.title || '').localeCompare(b.title || '');
       });
+    if (team === 'Comp-leg') {
+      teamDkrs = teamDkrs.filter((r) => {
+        const pn = r.project || (r.children && r.children[0] && r.children[0].projectName) || null;
+        return isCompLegOkrProjectName(pn);
+      });
+    }
     teamDkrs.forEach(r => {
       const children = r.children || [];
       const useChildren = children.length > 0;
@@ -917,7 +1048,7 @@ function buildDashboardData(issues) {
       else if (completion >= 25) status = 'at_risk';
       // OKR assignment: parent's project, or first child's project if parent has none
       const projectName = r.project || (r.children && r.children[0] && r.children[0].projectName) || null;
-      const okrNum = getOkrNumFromProject(projectName);
+      const okrNum = getOkrNumFromProjectName(projectName);
       const projectUrl = r.projectUrl || null;
       issuesByOKR[r.id] = list.map(x => ({ id: x.id, title: x.title, team, assignee: x.assignee, priority: x.priority, url: x.url }));
       dkrSummaryByTeam[team] = dkrSummaryByTeam[team] || [];
@@ -930,7 +1061,41 @@ function buildDashboardData(issues) {
     });
   });
 
-  // OKR CARDS: LTO tiene 6 OKRs (1–6); Comp-leg, FCP y RPA solo 3 (OKR1–3). Comp-leg no replica la suma de los 6.
+  // Comp-leg: nombres de proyectos OKR desde API o desde issues. Usar r.team (team en Linear), NO getDashboardTeam (que prioriza assignee y reclasifica a FCP/LTO/RPA).
+  const compLegRows = rowsActive.filter((r) => r.team === 'Comp-leg');
+  const compLegWithProject = compLegRows.filter((r) => r.project);
+  const compLegOkrProjects = compLegWithProject.filter((r) => isCompLegOkrProjectName(r.project));
+  const compLegProjectNamesFromIssues = [...new Set(compLegOkrProjects.map((r) => r.project))].sort((a, b) => {
+    const na = getOkrNumFromProjectName(a);
+    const nb = getOkrNumFromProjectName(b);
+    if (na == null && nb == null) return (a || '').localeCompare(b || '');
+    if (na == null) return 1;
+    if (nb == null) return -1;
+    return na !== nb ? na - nb : (a || '').localeCompare(b || '');
+  });
+  const compLegOkrNamesResolved = [1, 2, 3].map(
+    (n) => (compLegOkrProjectNames && compLegOkrProjectNames[n - 1]) || compLegProjectNamesFromIssues.find((p) => getOkrNumFromProjectName(p) === n) || null
+  );
+
+  // Diagnóstico Comp-leg (origen de datos OKR): se imprime al correr el sync
+  if (process.env.DEBUG_COMPLEG || compLegOkrNamesResolved.every((n) => !n)) {
+    const teamKeysFromRows = [...new Set(rowsActive.slice(0, 200).map((r) => r.team))];
+    console.error('[Comp-leg OKR] Origen de datos: issues de Linear (campo team + project).');
+    console.error('[Comp-leg OKR] Issues con team Comp-leg (después de normalizeTeam):', compLegRows.length);
+    console.error('[Comp-leg OKR] De esas, con project no vacío:', compLegWithProject.length);
+    console.error('[Comp-leg OKR] De esas, project es OKR (no Daily Tasks/CSE&Legal):', compLegOkrProjects.length);
+    console.error('[Comp-leg OKR] Nombres de proyecto OKR encontrados:', compLegProjectNamesFromIssues);
+    console.error('[Comp-leg OKR] Nombres resueltos para OKR1/2/3:', compLegOkrNamesResolved);
+    if (compLegWithProject.length > 0 && compLegOkrProjects.length === 0) {
+      const sampleProjects = [...new Set(compLegWithProject.map((r) => r.project))].slice(0, 5);
+      console.error('[Comp-leg OKR] Ejemplos de project en issues Comp-leg (no pasan filtro OKR):', sampleProjects);
+    }
+    if (compLegRows.length === 0 && rowsActive.length > 0) {
+      console.error('[Comp-leg OKR] Teams que sí aparecen en las issues (muestra):', teamKeysFromRows);
+    }
+  }
+
+  // OKR CARDS: LTO tiene 6 OKRs (1–6); Comp-leg, FCP y RPA solo 3 (OKR1–3). Comp-leg = por proyecto (todas las issues del proyecto), no solo DKRs.
   const okrsDataByTeam = {};
   const issuesByOKRForCards = {};
   const okrCardNames = { 1: 'OKR1', 2: 'OKR2', 3: 'OKR3', 4: 'OKR4', 5: 'OKR5', 6: 'OKR6' };
@@ -939,40 +1104,73 @@ function buildDashboardData(issues) {
     const teamDkrRows = dkrRowsByTeam[team] || [];
     const okrSlots = okrSlotsForTeam(team);
     okrsDataByTeam[team] = okrSlots.map(okrNum => {
-      const dkrsForOkr = teamDkrRows.filter(dkr => dkr.okrNum === okrNum);
-      const total = dkrsForOkr.length;
-      const open = dkrsForOkr.filter(dkr => OPEN_STATUSES.includes(dkr.parentState)).length;
-      // DKR cerrados = Done + Not Achieved (finalizados, aunque no logrados)
-      const doneCount = dkrsForOkr.filter(dkr => dkr.parentState === 'Done').length;
-      const notAchievedCount = dkrsForOkr.filter(dkr => /not\s*achieved/i.test(dkr.parentState || '')).length;
-      const closed = doneCount + notAchievedCount;
-      // Total issues = suma de todas las issues (padre + sub-issues) bajo este OKR
-      const totalIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.length || 0), 0);
-      const openIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.filter(i => OPEN_STATUSES.includes(i.state)).length || 0), 0);
-      const closedIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.filter(i => i.state === 'Done').length || 0), 0);
-      const name = dkrsForOkr[0]?.projectName || okrCardNames[okrNum];
-      const projectUrl = dkrsForOkr[0]?.projectUrl || null;
-      if (dkrsForOkr.length > 0) {
-        const allIssues = dkrsForOkr.flatMap(dkr => (dkr.list || []).map(x => ({ id: x.id, title: x.title, team, assignee: x.assignee, priority: x.priority || 'None', url: x.url, state: x.state })));
-        issuesByOKRForCards[`${team}:${name}`] = allIssues;
+      const dkrsForOkr = teamDkrRows.filter((dkr) => dkr.okrNum === okrNum);
+      let name = dkrsForOkr[0]?.projectName || okrCardNames[okrNum];
+      let projectUrl = dkrsForOkr[0]?.projectUrl || null;
+      let total = dkrsForOkr.length;
+      let open = dkrsForOkr.filter((dkr) => OPEN_STATUSES.includes(dkr.parentState)).length;
+      let doneCount = dkrsForOkr.filter((dkr) => dkr.parentState === 'Done').length;
+      let notAchievedCount = dkrsForOkr.filter((dkr) => /not\s*achieved/i.test(dkr.parentState || '')).length;
+      let closed = doneCount + notAchievedCount;
+      let totalIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.length || 0), 0);
+      let openIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.filter((i) => OPEN_STATUSES.includes(i.state)).length || 0), 0);
+      let closedIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.filter((i) => i.state === 'Done').length || 0), 0);
+      let completion = total > 0 ? Math.round((doneCount / total) * 100) : 0;
+      let allIssuesForCard = dkrsForOkr.length > 0 ? dkrsForOkr.flatMap((dkr) => (dkr.list || []).map((x) => ({ id: x.id, title: x.title, team, assignee: x.assignee, priority: x.priority || 'None', url: x.url, state: x.state }))) : [];
+
+      // Comp-leg: rellenar desde proyectos (todas las issues del proyecto), no solo DKRs
+      let burndownSourceRows = dkrsForOkr;
+      if (team === 'Comp-leg') {
+        const resolvedName = compLegOkrNamesResolved[okrNum - 1];
+        if (resolvedName) {
+          name = resolvedName;
+          const issuesInProject = rowsActive.filter((r) => r.team === 'Comp-leg' && r.project === resolvedName);
+          totalIssues = issuesInProject.length;
+          openIssues = issuesInProject.filter((r) => OPEN_STATUSES.includes(r.state)).length;
+          closedIssues = issuesInProject.filter((r) => r.state === 'Done').length;
+          total = totalIssues;
+          open = openIssues;
+          closed = closedIssues;
+          completion = totalIssues > 0 ? Math.round((closedIssues / totalIssues) * 100) : 0;
+          allIssuesForCard = issuesInProject.map((r) => ({ id: r.id, title: r.title, team, assignee: r.assignee, priority: r.priority || 'None', url: r.url, state: r.state }));
+          const firstRow = issuesInProject[0];
+          if (firstRow && firstRow.projectUrl) projectUrl = firstRow.projectUrl;
+          burndownSourceRows = issuesInProject;
+        }
       }
-      // Porcentaje de cumplimiento = DKRs logrados (Done) / total DKRs
-      const completion = total > 0 ? Math.round((doneCount / total) * 100) : 0;
-      const hasOnHold = dkrsForOkr.some(dkr => dkr.parentState === 'On Hold');
+
+      if (team === 'Comp-leg') {
+        issuesByOKRForCards[`Comp-leg:OKR${okrNum}`] = allIssuesForCard;
+      } else if (dkrsForOkr.length > 0) {
+        issuesByOKRForCards[`${team}:${name}`] = allIssuesForCard;
+      }
+
+      const hasOnHold = dkrsForOkr.some((dkr) => dkr.parentState === 'On Hold');
       const hasNoAchieved = notAchievedCount > 0;
-      const okrDueDates = dkrsForOkr.map(dkr => dkr.parentDueDate).filter(Boolean);
+      const okrDueDates = dkrsForOkr.map((dkr) => dkr.parentDueDate).filter(Boolean);
       const latestDueDate = okrDueDates.length > 0 ? okrDueDates.sort().pop() : null;
       const today = new Date().toISOString().slice(0, 10);
       const isOverdue = latestDueDate != null && today > latestDueDate && completion < 100;
       let status = 'blocked';
-      if (hasNoAchieved) status = 'no_achieved'; // Algún DKR en estado "No achieved" → rojo
-      else if (hasOnHold) status = 'blocked'; // On Hold prima: si algún DKR está On Hold → Blocked
-      else if (completion >= 100) status = 'done';
-      else if (isOverdue) status = 'at_risk'; // Se superó la fecha de vencimiento del OKR → At Risk
-      else if (completion >= 50) status = 'on_track';
-      else if (completion >= 25) status = 'at_risk';
-      const burndown = buildOkrBurndown(dkrsForOkr, today);
-      return { name, team, total, open, closed, totalIssues, openIssues, closedIssues, completion, target: 100, status, url: projectUrl, burndown };
+      if (team === 'Comp-leg' && projectStateMap && projectStateMap.size > 0) {
+        const projectState = (projectStateMap.get(name) || '').toLowerCase();
+        if (/released|completed/.test(projectState)) status = 'done';
+        else if (/not\s*achieved/.test(projectState)) status = 'no_achieved';
+        else status = 'blocked';
+      } else {
+        if (hasNoAchieved) status = 'no_achieved';
+        else if (hasOnHold) status = 'blocked';
+        else if (completion >= 100) status = 'done';
+        else if (isOverdue) status = 'at_risk';
+        else if (completion >= 50) status = 'on_track';
+        else if (completion >= 25) status = 'at_risk';
+      }
+      const burndown = (team === 'Comp-leg' && burndownSourceRows.length > 0 && burndownSourceRows[0].createdAt != null)
+        ? buildBurndownFromIssues(burndownSourceRows, today)
+        : buildOkrBurndown(dkrsForOkr, today);
+      const card = { name, team, total, open, closed, totalIssues, openIssues, closedIssues, completion, target: 100, status, url: projectUrl, burndown };
+      if (team === 'Comp-leg') card.okrNum = okrNum;
+      return card;
     });
   });
   Object.assign(issuesByOKR, issuesByOKRForCards);
@@ -1415,6 +1613,7 @@ function formatOkrDataByTeamBlock(data) {
       out += `                {\n`;
       out += `                    name: '${safeName}',\n`;
       out += `                    team: '${okr.team}',\n`;
+      if (okr.okrNum != null) out += `                    okrNum: ${okr.okrNum},\n`;
       out += `                    total: ${okr.total}, open: ${okr.open}, closed: ${okr.closed},\n`;
       out += `                    totalIssues: ${totalIssues}, openIssues: ${openIssues}, closedIssues: ${closedIssues},\n`;
       out += `                    completion: ${okr.completion}, target: ${okr.target || 100},\n`;
@@ -1525,8 +1724,11 @@ async function main() {
     issues = await fetchAllIssues();
     console.log(`Fetched ${issues.length} issues.`);
   }
-  
-  const data = buildDashboardData(issues);
+
+  const { projectStateMap, compLegOkrProjectNames } = (issues && !process.argv[2])
+    ? (await fetchProjectStates().catch(() => ({ projectStateMap: new Map(), compLegOkrProjectNames: [] })))
+    : { projectStateMap: new Map(), compLegOkrProjectNames: [] };
+  const data = buildDashboardData(issues, projectStateMap, compLegOkrProjectNames);
 
   const htmlPath = HTML_FILE;
   let html = fs.readFileSync(htmlPath, 'utf8');
@@ -1639,6 +1841,13 @@ async function main() {
   fs.writeFileSync(htmlPath, html);
   console.log('Dashboard HTML updated successfully.');
   console.log(`Summary: ${data.summaryStats.totalOpen} open, ${data.summaryStats.overdue} overdue, ${data.summaryStats.totalClosed} closed.`);
+  const compLegOkrs = (data.okrsDataByTeam && data.okrsDataByTeam['Comp-leg']) || [];
+  const compLegWithData = compLegOkrs.filter((o) => (o.totalIssues || o.total || 0) > 0).length;
+  if (compLegWithData === 0 && compLegOkrs.length > 0) {
+    console.log('Comp-leg OKR: 0/3 cards with data. Run with DEBUG_COMPLEG=1 to see why.');
+  } else {
+    console.log(`Comp-leg OKR: ${compLegWithData}/3 cards with data.`);
+  }
 }
 
 main().catch(err => {
