@@ -911,7 +911,8 @@ function buildDashboardData(issues) {
       const closed = closedList.length;
       const completion = total > 0 ? Math.round((closed / total) * 100) : 0;
       let status = 'blocked';
-      if (completion >= 100) status = 'done';
+      if (/not\s*achieved/i.test(r.state || '')) status = 'no_achieved';
+      else if (completion >= 100) status = 'done';
       else if (completion >= 50) status = 'on_track';
       else if (completion >= 25) status = 'at_risk';
       // OKR assignment: parent's project, or first child's project if parent has none
@@ -929,45 +930,49 @@ function buildDashboardData(issues) {
     });
   });
 
-  // OKR 1–6 CARDS: count only DKR parent issues (not sub-issues). Open/Done = how many DKRs are in that state.
+  // OKR CARDS: LTO tiene 6 OKRs (1–6); Comp-leg, FCP y RPA solo 3 (OKR1–3). Comp-leg no replica la suma de los 6.
   const okrsDataByTeam = {};
   const issuesByOKRForCards = {};
   const okrCardNames = { 1: 'OKR1', 2: 'OKR2', 3: 'OKR3', 4: 'OKR4', 5: 'OKR5', 6: 'OKR6' };
-  const okrSlots = [1, 2, 3, 4, 5, 6];
+  const okrSlotsForTeam = (team) => (team === 'LTO' ? [1, 2, 3, 4, 5, 6] : [1, 2, 3]);
   MAIN_TEAMS.forEach(team => {
     const teamDkrRows = dkrRowsByTeam[team] || [];
+    const okrSlots = okrSlotsForTeam(team);
     okrsDataByTeam[team] = okrSlots.map(okrNum => {
       const dkrsForOkr = teamDkrRows.filter(dkr => dkr.okrNum === okrNum);
       const total = dkrsForOkr.length;
       const open = dkrsForOkr.filter(dkr => OPEN_STATUSES.includes(dkr.parentState)).length;
-      const closed = dkrsForOkr.filter(dkr => dkr.parentState === 'Done').length;
+      // DKR cerrados = Done + Not Achieved (finalizados, aunque no logrados)
+      const doneCount = dkrsForOkr.filter(dkr => dkr.parentState === 'Done').length;
+      const notAchievedCount = dkrsForOkr.filter(dkr => /not\s*achieved/i.test(dkr.parentState || '')).length;
+      const closed = doneCount + notAchievedCount;
+      // Total issues = suma de todas las issues (padre + sub-issues) bajo este OKR
+      const totalIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.length || 0), 0);
+      const openIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.filter(i => OPEN_STATUSES.includes(i.state)).length || 0), 0);
+      const closedIssues = dkrsForOkr.reduce((s, dkr) => s + (dkr.list?.filter(i => i.state === 'Done').length || 0), 0);
       const name = dkrsForOkr[0]?.projectName || okrCardNames[okrNum];
       const projectUrl = dkrsForOkr[0]?.projectUrl || null;
       if (dkrsForOkr.length > 0) {
-        issuesByOKRForCards[`${team}:${name}`] = dkrsForOkr.map(dkr => ({
-          id: dkr.identifier,
-          title: dkr.name,
-          team,
-          assignee: dkr.parentAssignee || 'Unassigned',
-          priority: dkr.parentPriority || 'None',
-          url: dkr.parentUrl || '',
-          state: dkr.parentState || 'Unknown',
-        }));
+        const allIssues = dkrsForOkr.flatMap(dkr => (dkr.list || []).map(x => ({ id: x.id, title: x.title, team, assignee: x.assignee, priority: x.priority || 'None', url: x.url, state: x.state })));
+        issuesByOKRForCards[`${team}:${name}`] = allIssues;
       }
-      const completion = total > 0 ? Math.round((closed / total) * 100) : 0;
+      // Porcentaje de cumplimiento = DKRs logrados (Done) / total DKRs
+      const completion = total > 0 ? Math.round((doneCount / total) * 100) : 0;
       const hasOnHold = dkrsForOkr.some(dkr => dkr.parentState === 'On Hold');
+      const hasNoAchieved = notAchievedCount > 0;
       const okrDueDates = dkrsForOkr.map(dkr => dkr.parentDueDate).filter(Boolean);
       const latestDueDate = okrDueDates.length > 0 ? okrDueDates.sort().pop() : null;
       const today = new Date().toISOString().slice(0, 10);
       const isOverdue = latestDueDate != null && today > latestDueDate && completion < 100;
       let status = 'blocked';
-      if (hasOnHold) status = 'blocked'; // On Hold prima: si algún DKR está On Hold → Blocked
+      if (hasNoAchieved) status = 'no_achieved'; // Algún DKR en estado "No achieved" → rojo
+      else if (hasOnHold) status = 'blocked'; // On Hold prima: si algún DKR está On Hold → Blocked
       else if (completion >= 100) status = 'done';
       else if (isOverdue) status = 'at_risk'; // Se superó la fecha de vencimiento del OKR → At Risk
       else if (completion >= 50) status = 'on_track';
       else if (completion >= 25) status = 'at_risk';
       const burndown = buildOkrBurndown(dkrsForOkr, today);
-      return { name, team, total, open, closed, completion, target: 100, status, url: projectUrl, burndown };
+      return { name, team, total, open, closed, totalIssues, openIssues, closedIssues, completion, target: 100, status, url: projectUrl, burndown };
     });
   });
   Object.assign(issuesByOKR, issuesByOKRForCards);
@@ -1396,7 +1401,7 @@ function formatDataQualityBlock(data) {
 function formatOkrDataByTeamBlock(data) {
   const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '-');
   const okrsByTeam = data.okrsDataByTeam || {};
-  let out = `        // OKR Data by Team (CARDS: only OKR 1, 2, 3 from Linear project)\n`;
+  let out = `        // OKR Data by Team (CARDS: OKR 1–6 from Linear project; totalIssues = issues bajo cada OKR)\n`;
   out += `        // UPDATED FROM LINEAR - ${dateStr}\n`;
   out += `        const okrsDataByTeam = {\n`;
   ['Comp-leg', 'FCP', 'LTO', 'RPA'].forEach(team => {
@@ -1404,10 +1409,14 @@ function formatOkrDataByTeamBlock(data) {
     out += `            '${team}': [\n`;
     arr.forEach(okr => {
       const safeName = (okr.name || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      const totalIssues = okr.totalIssues != null ? okr.totalIssues : okr.total;
+      const openIssues = okr.openIssues != null ? okr.openIssues : okr.open;
+      const closedIssues = okr.closedIssues != null ? okr.closedIssues : okr.closed;
       out += `                {\n`;
       out += `                    name: '${safeName}',\n`;
       out += `                    team: '${okr.team}',\n`;
       out += `                    total: ${okr.total}, open: ${okr.open}, closed: ${okr.closed},\n`;
+      out += `                    totalIssues: ${totalIssues}, openIssues: ${openIssues}, closedIssues: ${closedIssues},\n`;
       out += `                    completion: ${okr.completion}, target: ${okr.target || 100},\n`;
       out += `                    status: '${okr.status}',\n`;
       out += `                    url: ${okr.url ? `'${String(okr.url).replace(/'/g, "\\'")}'` : 'null'},\n`;
