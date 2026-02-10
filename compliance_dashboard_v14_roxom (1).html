@@ -2555,8 +2555,8 @@
                 return true;
             });
         }
-        // Order for By Status chart (all tabs) – must match sync script STATUS_ORDER
-        const CHART_STATUS_ORDER = ['Backlog', 'In Progress', 'Ongoing', 'On Hold', 'Todo', 'In Review', 'Pending Signature', 'Triage'];
+        // Order for By Status chart (all tabs) – desired: Backlog, Todo, In Progress, On Hold, In Review
+        const CHART_STATUS_ORDER = ['Backlog', 'Todo', 'In Progress', 'On Hold', 'In Review', 'Ongoing', 'Pending Signature', 'Triage'];
         const CHART_PRIORITY_ORDER = ['None', 'Low', 'Medium', 'High', 'Urgent'];
         function sortByStatusOrderForChart(arr) {
             if (!Array.isArray(arr)) return arr;
