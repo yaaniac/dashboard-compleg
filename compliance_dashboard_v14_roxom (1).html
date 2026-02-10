@@ -3276,6 +3276,24 @@
                 }
             };
 
+            // Throughput ratio for "All" in By Team should match Performance "Throughput Ratio" (promedio por área, sin PGA)
+            const throughputByTeamForAll = (stats.byTeam || []).map((t) => {
+                const open = t.open || 0;
+                const closed = t.closed || 0;
+                const ratioNum = open > 0 ? closed / open : 0;
+                return { team: t.team, open, closed, ratioNum };
+            });
+            const throughputMainTeamsForAll = throughputByTeamForAll.filter((r) => r.team !== 'PGA');
+            const throughputAllRatio = throughputMainTeamsForAll.length > 0
+                ? (throughputMainTeamsForAll.reduce((sum, r) => sum + r.ratioNum, 0) / throughputMainTeamsForAll.length).toFixed(2)
+                : '0.00';
+
+            const throughputCardValue = selectedTeam === 'All'
+                ? throughputAllRatio
+                : ((teamInfo.open ?? 0) > 0
+                    ? ((teamInfo.closed ?? 0) / (teamInfo.open ?? 1)).toFixed(2)
+                    : ((teamInfo.closed ?? 0) === 0 ? '0.00' : '—'));
+
             return (
                 <div className="space-y-6">
                     <Sidebar
@@ -3329,7 +3347,7 @@
                         <KPICard title="Closed" value={teamInfo.closed ?? 0} color="green" tooltip={(teamInfo.closed ?? 0) > 0 ? "Issues in Done status. Click to see the list." : "Issues in Done status"} onClick={(teamInfo.closed ?? 0) > 0 ? handleClosedClick : undefined} />
                         <KPICard title="Overdue" value={teamInfo.overdue ?? 0} color="red" tooltip={(teamInfo.overdue ?? 0) > 0 ? "Open issues past their due date. Click to see the list." : "Open issues past their due date"} onClick={(teamInfo.overdue ?? 0) > 0 ? handleOverdueClick : undefined} />
                         <KPICard title="Velocity" value={teamInfo.velocity != null ? teamInfo.velocity : 'N/A'} subtitle="issues/week" color="blue" tooltip="Average issues closed per week (last 10 weeks)" />
-                        <KPICard title="Throughput" value={(teamInfo.open ?? 0) > 0 ? ((teamInfo.closed ?? 0) / (teamInfo.open ?? 1)).toFixed(2) : ((teamInfo.closed ?? 0) === 0 ? '0.00' : '—')} subtitle="closed ÷ open" color="indigo" tooltip="Throughput ratio: closed ÷ open. >1 = el equipo cierra más de lo que tiene abierto (misma lógica que Performance / By Person)." />
+                        <KPICard title="Throughput" value={throughputCardValue} subtitle="closed ÷ open" color="indigo" tooltip={selectedTeam === 'All' ? "Throughput ratio promedio de Comp-leg, FCP, LTO y RPA (closed ÷ open), mismo valor que Performance > Throughput Ratio." : "Throughput ratio: closed ÷ open para el equipo seleccionado. >1 = el equipo cierra más de lo que tiene abierto (misma lógica que Performance / By Person)."} />
                     </div>
                     <div className="grid-4">
                         <KPICard title="SLA" value={teamInfo.sla != null ? `${teamInfo.sla}%` : 'N/A'} subtitle="% closed by due date" color={teamInfo.sla != null ? (teamInfo.sla >= 80 ? 'green' : teamInfo.sla >= 50 ? 'yellow' : 'red') : 'gray'} tooltip="% of closed issues (with due date) completed on time. Higher is better." />
